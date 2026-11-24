@@ -1,12 +1,17 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! AKAO companion wave & articulation bank parser, SPU RAM relocation, and upload.
+//!
+//! [`AkaoWaveBankView`] provides zero-allocation borrowed parsing usable in pure
+//! `#![no_std]` environments without `alloc`. With the `alloc` feature enabled,
+//! [`AkaoWaveBank`] provides an owned representation with relocation and upload.
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::sequence::AKAO_MAGIC;
 use crate::version::AkaoVersion;
-use crate::Error;
+use crate::{Error, Result};
 
 /// Unified AKAO wave bank header size in bytes (`V2a`, `V2b`, `V3`).
 pub const WAVE_BANK_HEADER_SIZE: usize = 0x40;
@@ -36,7 +41,7 @@ impl Articulation {
     /// - `+0x0C`: `adsr1: u16`
     /// - `+0x0E`: `adsr2: u16`
     #[must_use]
-    pub fn from_64b(entry: &[u8; 64]) -> Self {
+    pub const fn from_64b(entry: &[u8; 64]) -> Self {
         Self {
             start_addr: u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]),
             loop_addr: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
@@ -55,7 +60,7 @@ impl Articulation {
     /// - `+0x0C`: `adsr1: u16`
     /// - `+0x0E`: `adsr2: u16`
     #[must_use]
-    pub fn from_16b(entry: &[u8; 16]) -> Self {
+    pub const fn from_16b(entry: &[u8; 16]) -> Self {
         Self {
             start_addr: u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]),
             loop_addr: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
@@ -66,76 +71,42 @@ impl Articulation {
     }
 }
 
-/// Parsed AKAO wave bank containing articulation entries and PS1 SPU ADPCM sample data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AkaoWaveBank {
+/// Zero-allocation borrowed view of a parsed AKAO wave & articulation bank.
+///
+/// Usable in pure `#![no_std]` builds without the `alloc` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AkaoWaveBankView<'a> {
     /// Generation format of this wave bank.
     pub version: AkaoVersion,
-    /// Target byte address in PS1 SPU RAM where [`Self::adpcm_data`] is uploaded.
+    /// Target byte address in PS1 SPU RAM where ADPCM data is uploaded.
     pub spu_base_addr: u32,
     /// Starting instrument index in the global instrument table.
     pub start_index: u32,
-    /// Articulation descriptors indexed relative to [`Self::start_index`].
-    pub articulations: Vec<Articulation>,
-    /// Raw PS1 SPU ADPCM sample payload.
-    pub adpcm_data: Vec<u8>,
+    art_slice: &'a [u8],
+    art_count: usize,
+    adpcm_data: &'a [u8],
 }
 
-impl AkaoWaveBank {
-    /// Constructs a wave bank directly from its components, validating SPU RAM bounds.
-    pub fn from_parts(
-        version: AkaoVersion,
-        spu_base_addr: u32,
-        start_index: u32,
-        articulations: Vec<Articulation>,
-        adpcm_data: Vec<u8>,
-    ) -> Result<Self, Error> {
-        validate_spu_range(spu_base_addr, adpcm_data.len())?;
-        if articulations.len() > version.max_wave_entries() {
-            return Err(Error::OutOfRange(
-                "wave bank entry count exceeds version limit",
-            ));
-        }
-        Ok(Self {
-            version,
-            spu_base_addr,
-            start_index,
-            articulations,
-            adpcm_data,
-        })
-    }
-
-    /// Parses an AKAO wave bank for the given [`AkaoVersion`].
-    ///
-    /// - **`V1`**: Supports both unified `"AKAO"` 64-byte headers and raw `V1` 16-byte
-    ///   headers (`+0x00 spu_addr`, `+0x04 adpcm_len`, `+0x08 art_count`, followed by
-    ///   `art_count * 64` bytes of articulations and `adpcm_len` bytes of ADPCM). For
-    ///   separate `.DAT` + `.ALL` buffers, use [`Self::parse_v1_separate`].
-    /// - **`V2a`**: Unified `"AKAO"` 64-byte header (`+0x10 spu_addr`, `+0x14 adpcm_len`,
-    ///   `+0x18 start_idx`), 64-byte entries (up to 128).
-    /// - **`V2b`**: Unified `"AKAO"` 64-byte header (`+0x10 spu_addr`, `+0x14 adpcm_len`,
-    ///   `+0x18 start_idx`, `+0x1C end_idx` with `0 => 256`), 64-byte entries (up to 256).
-    /// - **`V3`**: Unified `"AKAO"` 64-byte header (`+0x10 spu_addr`, `+0x14 adpcm_len`,
-    ///   `+0x18 start_idx`, `+0x1C count`), compacted 16-byte entries whose relative
-    ///   `start_addr` and `loop_addr` are relocated by `+ spu_base_addr`.
-    pub fn parse(bytes: &[u8], version: AkaoVersion) -> Result<Self, Error> {
+impl<'a> AkaoWaveBankView<'a> {
+    /// Parses a borrowed AKAO wave bank view for `version` without allocating.
+    pub fn parse(bytes: &'a [u8], version: AkaoVersion) -> Result<Self> {
         match version {
             AkaoVersion::V1 => {
                 if bytes.len() >= 4 && bytes[0..4] == AKAO_MAGIC {
-                    parse_unified_bank(bytes, AkaoVersion::V1)
+                    parse_unified_bank_view(bytes, AkaoVersion::V1)
                 } else {
-                    parse_v1_raw_combined(bytes)
+                    parse_v1_raw_combined_view(bytes)
                 }
             }
             AkaoVersion::V2a | AkaoVersion::V2b | AkaoVersion::V3 => {
-                parse_unified_bank(bytes, version)
+                parse_unified_bank_view(bytes, version)
             }
         }
     }
 
-    /// Parses separate AKAO `V1` articulation (`.DAT`, 64 B entries) and sample (`.ALL`,
-    /// 16 B header `+0x00 spu_addr`, `+0x04 adpcm_len`, data at `+0x10`) buffers.
-    pub fn parse_v1_separate(art_bytes: &[u8], all_bytes: &[u8]) -> Result<Self, Error> {
+    /// Parses separate AKAO `V1` articulation (`.DAT`, 64 B entries) and sample (`.ALL`)
+    /// buffers into a borrowed view without allocating.
+    pub fn parse_v1_separate(art_bytes: &'a [u8], all_bytes: &'a [u8]) -> Result<Self> {
         if all_bytes.len() < 0x10 {
             return Err(Error::UnexpectedEof("V1 .ALL header"));
         }
@@ -155,20 +126,127 @@ impl AkaoWaveBank {
         }
         validate_spu_range(spu_base_addr, adpcm_len)?;
 
-        let mut articulations = Vec::with_capacity(count);
-        for chunk in art_bytes.chunks_exact(64) {
-            let mut arr = [0u8; 64];
-            arr.copy_from_slice(chunk);
-            articulations.push(Articulation::from_64b(&arr));
-        }
-
         Ok(Self {
             version: AkaoVersion::V1,
             spu_base_addr,
             start_index: 0,
-            articulations,
-            adpcm_data: all_bytes[0x10..0x10 + adpcm_len].to_vec(),
+            art_slice: art_bytes,
+            art_count: count,
+            adpcm_data: &all_bytes[0x10..0x10 + adpcm_len],
         })
+    }
+
+    /// Returns the number of articulation entries in this bank.
+    #[inline]
+    #[must_use]
+    pub const fn articulation_count(&self) -> usize {
+        self.art_count
+    }
+
+    /// Decodes an articulation by global instrument index (`index >= start_index`).
+    #[must_use]
+    pub fn articulation(&self, index: usize) -> Option<Articulation> {
+        let rel = index.checked_sub(self.start_index as usize)?;
+        if rel >= self.art_count {
+            return None;
+        }
+        let stride = self.version.articulation_stride();
+        let off = rel * stride;
+        match self.version {
+            AkaoVersion::V1 | AkaoVersion::V2a | AkaoVersion::V2b => {
+                let arr: [u8; 64] = self.art_slice[off..off + 64].try_into().ok()?;
+                Some(Articulation::from_64b(&arr))
+            }
+            AkaoVersion::V3 => {
+                let arr: [u8; 16] = self.art_slice[off..off + 16].try_into().ok()?;
+                let mut art = Articulation::from_16b(&arr);
+                art.start_addr = art.start_addr.checked_add(self.spu_base_addr)?;
+                art.loop_addr = art.loop_addr.checked_add(self.spu_base_addr)?;
+                Some(art)
+            }
+        }
+    }
+
+    /// Returns the raw PS1 SPU ADPCM payload slice.
+    #[inline]
+    #[must_use]
+    pub const fn adpcm_data(&self) -> &'a [u8] {
+        self.adpcm_data
+    }
+
+    /// Converts this borrowed view into an owned [`AkaoWaveBank`].
+    #[cfg(feature = "alloc")]
+    pub fn to_owned_bank(&self) -> Result<AkaoWaveBank> {
+        let mut articulations = Vec::with_capacity(self.art_count);
+        let base = self.start_index as usize;
+        for rel in 0..self.art_count {
+            let art = self
+                .articulation(base + rel)
+                .ok_or(Error::OutOfRange("articulation decode failed"))?;
+            articulations.push(art);
+        }
+        Ok(AkaoWaveBank {
+            version: self.version,
+            spu_base_addr: self.spu_base_addr,
+            start_index: self.start_index,
+            articulations,
+            adpcm_data: self.adpcm_data.to_vec(),
+        })
+    }
+}
+
+/// Owned parsed AKAO wave bank containing articulation entries and PS1 SPU ADPCM sample data.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AkaoWaveBank {
+    /// Generation format of this wave bank.
+    pub version: AkaoVersion,
+    /// Target byte address in PS1 SPU RAM where [`Self::adpcm_data`] is uploaded.
+    pub spu_base_addr: u32,
+    /// Starting instrument index in the global instrument table.
+    pub start_index: u32,
+    /// Articulation descriptors indexed relative to [`Self::start_index`].
+    pub articulations: Vec<Articulation>,
+    /// Raw PS1 SPU ADPCM sample payload.
+    pub adpcm_data: Vec<u8>,
+}
+
+#[cfg(feature = "alloc")]
+impl AkaoWaveBank {
+    /// Constructs a wave bank directly from its components, validating SPU RAM bounds.
+    pub fn from_parts(
+        version: AkaoVersion,
+        spu_base_addr: u32,
+        start_index: u32,
+        articulations: Vec<Articulation>,
+        adpcm_data: Vec<u8>,
+    ) -> Result<Self> {
+        validate_spu_range(spu_base_addr, adpcm_data.len())?;
+        if articulations.len() > version.max_wave_entries() {
+            return Err(Error::OutOfRange(
+                "wave bank entry count exceeds version limit",
+            ));
+        }
+        Ok(Self {
+            version,
+            spu_base_addr,
+            start_index,
+            articulations,
+            adpcm_data,
+        })
+    }
+
+    /// Parses an AKAO wave bank for the given [`AkaoVersion`].
+    pub fn parse(bytes: &[u8], version: AkaoVersion) -> Result<Self> {
+        let view = AkaoWaveBankView::parse(bytes, version)?;
+        view.to_owned_bank()
+    }
+
+    /// Parses separate AKAO `V1` articulation (`.DAT`, 64 B entries) and sample (`.ALL`,
+    /// 16 B header `+0x00 spu_addr`, `+0x04 adpcm_len`, data at `+0x10`) buffers.
+    pub fn parse_v1_separate(art_bytes: &[u8], all_bytes: &[u8]) -> Result<Self> {
+        let view = AkaoWaveBankView::parse_v1_separate(art_bytes, all_bytes)?;
+        view.to_owned_bank()
     }
 
     /// Looks up an articulation by global instrument index (`index >= start_index`).
@@ -184,7 +262,7 @@ impl AkaoWaveBank {
     ///
     /// Adjusts [`Self::spu_base_addr`] and shifts every articulation's `start_addr`
     /// and `loop_addr` by `new_spu_base - old_spu_base` (preserving zero addresses).
-    pub fn relocate(&mut self, new_spu_base: u32) -> Result<(), Error> {
+    pub fn relocate(&mut self, new_spu_base: u32) -> Result<()> {
         if (new_spu_base & 0x7) != 0 {
             return Err(Error::InvalidArgument(
                 "SPU base address must be 8-byte aligned",
@@ -217,7 +295,7 @@ impl AkaoWaveBank {
     }
 
     /// Uploads [`Self::adpcm_data`] into `device` at [`Self::spu_base_addr`].
-    pub fn upload_to_spu(&self, device: &mut libspu2::Device) -> Result<(), Error> {
+    pub fn upload_to_spu(&self, device: &mut libspu2::Device) -> Result<()> {
         let end = (self.spu_base_addr as usize)
             .checked_add(self.adpcm_data.len())
             .ok_or(Error::OutOfRange("SPU RAM upload range overflow"))?;
@@ -229,7 +307,7 @@ impl AkaoWaveBank {
     }
 }
 
-fn parse_v1_raw_combined(bytes: &[u8]) -> Result<AkaoWaveBank, Error> {
+fn parse_v1_raw_combined_view<'a>(bytes: &'a [u8]) -> Result<AkaoWaveBankView<'a>> {
     if bytes.len() < 0x10 {
         return Err(Error::UnexpectedEof("V1 wave bank header"));
     }
@@ -253,23 +331,20 @@ fn parse_v1_raw_combined(bytes: &[u8]) -> Result<AkaoWaveBank, Error> {
     }
     validate_spu_range(spu_base_addr, adpcm_len)?;
 
-    let mut articulations = Vec::with_capacity(art_count);
-    for chunk in bytes[0x10..adpcm_offset].chunks_exact(64) {
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(chunk);
-        articulations.push(Articulation::from_64b(&arr));
-    }
-
-    Ok(AkaoWaveBank {
+    Ok(AkaoWaveBankView {
         version: AkaoVersion::V1,
         spu_base_addr,
         start_index: 0,
-        articulations,
-        adpcm_data: bytes[adpcm_offset..adpcm_offset + adpcm_len].to_vec(),
+        art_slice: &bytes[0x10..adpcm_offset],
+        art_count,
+        adpcm_data: &bytes[adpcm_offset..adpcm_offset + adpcm_len],
     })
 }
 
-fn parse_unified_bank(bytes: &[u8], version: AkaoVersion) -> Result<AkaoWaveBank, Error> {
+fn parse_unified_bank_view<'a>(
+    bytes: &'a [u8],
+    version: AkaoVersion,
+) -> Result<AkaoWaveBankView<'a>> {
     if bytes.len() < WAVE_BANK_HEADER_SIZE {
         return Err(Error::UnexpectedEof("AKAO wave bank 64-byte header"));
     }
@@ -289,8 +364,6 @@ fn parse_unified_bank(bytes: &[u8], version: AkaoVersion) -> Result<AkaoWaveBank
             if start_index as usize > max_entries {
                 return Err(Error::OutOfRange("wave bank start_index exceeds 128"));
             }
-            // If field_1c is explicitly set and valid, respect it; otherwise infer from remaining bytes
-            // or `128 - start_index`.
             let max_by_index = max_entries - start_index as usize;
             let avail_for_art = bytes
                 .len()
@@ -345,52 +418,39 @@ fn parse_unified_bank(bytes: &[u8], version: AkaoVersion) -> Result<AkaoWaveBank
 
     validate_spu_range(spu_base_addr, adpcm_len)?;
 
-    let mut articulations = Vec::with_capacity(count);
     let art_slice = &bytes[WAVE_BANK_HEADER_SIZE..adpcm_offset];
-    match version {
-        AkaoVersion::V1 | AkaoVersion::V2a | AkaoVersion::V2b => {
-            for chunk in art_slice.chunks_exact(64) {
-                let mut arr = [0u8; 64];
-                arr.copy_from_slice(chunk);
-                articulations.push(Articulation::from_64b(&arr));
-            }
-        }
-        AkaoVersion::V3 => {
-            for chunk in art_slice.chunks_exact(16) {
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(chunk);
-                let mut art = Articulation::from_16b(&arr);
-                // V3 wave bank entries store SPU addresses relative to spu_base_addr.
-                art.start_addr = art
-                    .start_addr
-                    .checked_add(spu_base_addr)
-                    .ok_or(Error::OutOfRange("V3 start_addr relocation overflow"))?;
-                art.loop_addr = art
-                    .loop_addr
-                    .checked_add(spu_base_addr)
-                    .ok_or(Error::OutOfRange("V3 loop_addr relocation overflow"))?;
-                if art.start_addr as usize >= libspu2::PS1_RAM_SIZE
-                    || art.loop_addr as usize >= libspu2::PS1_RAM_SIZE
-                {
-                    return Err(Error::OutOfRange(
-                        "V3 relocated address exceeds PS1 SPU RAM",
-                    ));
-                }
-                articulations.push(art);
+    if version == AkaoVersion::V3 {
+        for chunk in art_slice.chunks_exact(16) {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(chunk);
+            let art = Articulation::from_16b(&arr);
+            let start = art
+                .start_addr
+                .checked_add(spu_base_addr)
+                .ok_or(Error::OutOfRange("V3 start_addr relocation overflow"))?;
+            let loop_a = art
+                .loop_addr
+                .checked_add(spu_base_addr)
+                .ok_or(Error::OutOfRange("V3 loop_addr relocation overflow"))?;
+            if start as usize >= libspu2::PS1_RAM_SIZE || loop_a as usize >= libspu2::PS1_RAM_SIZE {
+                return Err(Error::OutOfRange(
+                    "V3 relocated address exceeds PS1 SPU RAM",
+                ));
             }
         }
     }
 
-    Ok(AkaoWaveBank {
+    Ok(AkaoWaveBankView {
         version,
         spu_base_addr,
         start_index,
-        articulations,
-        adpcm_data: bytes[adpcm_offset..adpcm_offset + adpcm_len].to_vec(),
+        art_slice,
+        art_count: count,
+        adpcm_data: &bytes[adpcm_offset..adpcm_offset + adpcm_len],
     })
 }
 
-fn validate_spu_range(spu_base_addr: u32, adpcm_len: usize) -> Result<(), Error> {
+fn validate_spu_range(spu_base_addr: u32, adpcm_len: usize) -> Result<()> {
     let end = (spu_base_addr as usize)
         .checked_add(adpcm_len)
         .ok_or(Error::OutOfRange("SPU RAM range overflow"))?;

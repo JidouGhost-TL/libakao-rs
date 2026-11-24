@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 #![doc = include_str!("../README.md")]
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "alloc")]
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
@@ -13,15 +14,26 @@ use core::fmt;
 
 pub mod bank;
 pub mod opcodes;
+#[cfg(feature = "alloc")]
 pub mod player;
+pub mod reverb;
 pub mod sequence;
 pub mod version;
 
-pub use bank::{AkaoWaveBank, Articulation};
+#[cfg(feature = "alloc")]
+pub use bank::AkaoWaveBank;
+pub use bank::{AkaoWaveBankView, Articulation, WAVE_BANK_HEADER_SIZE};
 pub use opcodes::{decode_opcode, ExtendedOpcode, Opcode, DURATION_TABLE};
+#[cfg(feature = "alloc")]
 pub use player::{AkaoPlayer, ChannelSnapshot, FadeCurve, RenderConfig, RenderResult};
-pub use sequence::{AkaoSequence, DrumEntry, KeysplitEntry, AKAO_MAGIC};
+pub use reverb::{ReverbParams, ReverbPreset};
+#[cfg(feature = "alloc")]
+pub use sequence::AkaoSequence;
+pub use sequence::{AkaoSequenceView, DrumEntry, KeysplitEntry, AKAO_MAGIC};
 pub use version::{detect_version, AkaoVersion, PS1_ROOT_COUNTER_2_CLOCK_HZ};
+
+/// Crate-wide result type alias for `libakao`.
+pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors returned by `libakao` parsing, relocation, upload, and playback APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,16 +89,23 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Error>();
     assert_send_sync::<AkaoVersion>();
-    assert_send_sync::<AkaoSequence>();
+    assert_send_sync::<AkaoSequenceView<'static>>();
+    assert_send_sync::<AkaoWaveBankView<'static>>();
     assert_send_sync::<DrumEntry>();
     assert_send_sync::<KeysplitEntry>();
     assert_send_sync::<Articulation>();
-    assert_send_sync::<AkaoWaveBank>();
+    assert_send_sync::<ReverbPreset>();
+    assert_send_sync::<ReverbParams>();
     assert_send_sync::<Opcode>();
     assert_send_sync::<ExtendedOpcode>();
-    assert_send_sync::<FadeCurve>();
-    assert_send_sync::<RenderConfig>();
-    assert_send_sync::<RenderResult>();
-    assert_send_sync::<ChannelSnapshot>();
-    assert_send_sync::<AkaoPlayer>();
+    #[cfg(feature = "alloc")]
+    {
+        assert_send_sync::<AkaoSequence>();
+        assert_send_sync::<AkaoWaveBank>();
+        assert_send_sync::<FadeCurve>();
+        assert_send_sync::<RenderConfig>();
+        assert_send_sync::<RenderResult>();
+        assert_send_sync::<ChannelSnapshot>();
+        assert_send_sync::<AkaoPlayer>();
+    }
 };

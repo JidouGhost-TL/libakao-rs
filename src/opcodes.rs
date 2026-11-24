@@ -1,9 +1,13 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! AKAO bytecode opcode definitions and version-aware decoder.
+//!
+//! Operand byte lengths are separated by AKAO generation (`V1`, `V2a`/`V2b`, `V3`)
+//! so real PlayStation 1 streams never desynchronize across `0xCC..=0xFF` or
+//! extended `0xFC`/`0xFE` sub-opcodes.
 
 use crate::version::AkaoVersion;
-use crate::Error;
+use crate::{Error, Result};
 
 /// Standard AKAO 11-entry fixed note/tie/rest duration table (in ticks at 48 PPQN).
 ///
@@ -13,7 +17,7 @@ use crate::Error;
 /// and 32nd-triplet (`4`).
 pub const DURATION_TABLE: [u8; 11] = [192, 96, 48, 24, 12, 6, 3, 32, 16, 8, 4];
 
-/// Extended AKAO opcodes dispatched under prefix `0xFC` (`V1`/`V2a`/`V2b`) or `0xFE` (`V3`).
+/// Extended AKAO opcodes dispatched under prefix `0xFC` (`V2a`/`V2b`) or `0xFE` (`V3`).
 ///
 /// Relative jump/call `i16` offsets are relative to the byte address of the `i16` operand
 /// itself, matching the hardware AKAO dispatcher.
@@ -37,8 +41,10 @@ pub enum ExtendedOpcode {
         /// Target signed 16-bit reverb depth.
         target: i16,
     },
-    /// `0x04`: Enable drum/percussion mapping mode on this channel.
+    /// `0x04` (`V3`): Enable drum/percussion mapping mode on this channel.
     DrumModeOn,
+    /// `0x04 <i16 offset>` (`V2a`/`V2b`): Enable drum/percussion mapping mode with relative table offset.
+    DrumModeOnOffset(i16),
     /// `0x05`: Disable drum/percussion mapping mode on this channel.
     DrumModeOff,
     /// `0x06 <i16 offset>`: Unconditional relative jump (`pc = operand_addr + offset`).
@@ -64,11 +70,47 @@ pub enum ExtendedOpcode {
         /// Relative signed 16-bit jump offset from the `i16` operand address.
         offset: i16,
     },
-    /// `0x0E <i16 offset>` (`V3` only): Call subroutine at `operand_addr + offset`.
+    /// `0x0A <u8>`: Select instrument / articulation without resetting ADSR overrides.
+    SetInstrumentAlt(u8),
+    /// `0x0E <u8>` (`V2`): Set channel expression / volume balance (`0..=127`).
+    VolumeBalance(u8),
+    /// `0x0F <u8 duration> <u8 target>` (`V2`): Slide channel volume balance.
+    VolumeBalanceSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target volume balance (`0..=127`).
+        target: u8,
+    },
+    /// `0x0E <i16 offset>` (`V3`): Call subroutine at `operand_addr + offset`.
     SubroutineCall(i16),
-    /// `0x0F` (`V3` only): Return from subroutine.
+    /// `0x0F` (`V3`): Return from subroutine.
     SubroutineReturn,
-    /// Unrecognized extended sub-opcode byte.
+    /// `0x10 <u8>`: Select keysplit / bank region on this channel.
+    SetKeysplit(u8),
+    /// `0x11`: Clear keysplit mode on this channel.
+    ResetKeysplit,
+    /// `0x12 <u8 duration> <u8 target>`: Slide channel master volume.
+    MasterVolumeSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target master volume (`0..=127`).
+        target: u8,
+    },
+    /// `0x14 <u8>` (`V3`): Select custom keysplit instrument index.
+    SelectKeysplitInstrument(u8),
+    /// `0x15 <u8 num> <u8 den>`: Time signature marker (2 operand bytes).
+    TimeSignature(u8, u8),
+    /// `0x16 <u16 measure>`: Measure / bar marker (2 operand bytes).
+    MeasureNumber(u16),
+    /// Known 1-byte extended opcode consumed to preserve stream alignment.
+    Reserved1(u8, u8),
+    /// Known 2-byte extended opcode consumed to preserve stream alignment.
+    Reserved2(u8, u8, u8),
+    /// Known 3-byte extended opcode consumed to preserve stream alignment.
+    Reserved3(u8, [u8; 3]),
+    /// Known 4-byte extended opcode consumed to preserve stream alignment.
+    Reserved4(u8, [u8; 4]),
+    /// Unrecognized extended sub-opcode byte (0 operand bytes).
     Unknown(u8),
 }
 
@@ -92,9 +134,9 @@ pub enum Opcode {
         /// Duration in musical ticks.
         duration: u8,
     },
-    /// No-operation (`0x9A..=0x9F`).
+    /// No-operation (`0x9A..=0x9F`, and 0-byte reserved no-ops).
     Nop,
-    /// `0xA0` (and `0xFF` on `V3`): Halt channel and key off voice.
+    /// `0xA0` (and `0xFF`, plus unused halt slots): Halt channel and key off voice.
     EndOfTrack,
     /// `0xA1 <u8>`: Select instrument / articulation index.
     SetInstrument(u8),
@@ -158,12 +200,12 @@ pub enum Opcode {
     Vibrato {
         /// Delay in musical ticks before vibrato begins.
         delay: u8,
-        /// LFO step period in ticks (`0` treated as `256`).
+        /// Full-cycle LFO period in musical ticks (`0` treated as `256`).
         rate: u8,
         /// Waveform table selector (`0` sine, `1` triangle, `2` square, `3` sawtooth).
         waveform: u8,
     },
-    /// `0xB5 <u8>`: Set pitch vibrato LFO depth.
+    /// `0xB5 <u8>`: Set pitch vibrato LFO depth (bit `0x80` selects coarse range).
     VibratoDepth(u8),
     /// `0xB6`: Disable pitch vibrato LFO.
     VibratoOff,
@@ -173,7 +215,7 @@ pub enum Opcode {
     Tremolo {
         /// Delay in musical ticks before tremolo begins.
         delay: u8,
-        /// LFO step period in ticks (`0` treated as `256`).
+        /// Full-cycle LFO period in musical ticks (`0` treated as `256`).
         rate: u8,
         /// Waveform table selector.
         waveform: u8,
@@ -186,7 +228,7 @@ pub enum Opcode {
     SetAdsrSustainMode(u8),
     /// `0xBC <u8 rate> <u8 waveform>`: Enable stereo auto-pan LFO.
     AutoPan {
-        /// LFO step period in ticks (`0` treated as `256`).
+        /// Full-cycle LFO period in musical ticks (`0` treated as `256`).
         rate: u8,
         /// Waveform table selector.
         waveform: u8,
@@ -215,7 +257,7 @@ pub enum Opcode {
     PitchModOff,
     /// `0xC8`: Push current stream position onto the 4-deep loop stack.
     LoopStart,
-    /// `0xC9 <u8 count>`: Repeat loop (`count == 0` = infinite; otherwise `count` total iterations).
+    /// `0xC9 <u8 count>`: Repeat loop (`count == 0` = 256 iterations; otherwise `count` total iterations).
     LoopEnd(u8),
     /// `0xCA`: Unconditionally repeat the innermost loop (infinite loop).
     LoopInfinite,
@@ -225,10 +267,26 @@ pub enum Opcode {
     SlurOn,
     /// `0xCD`: Disable slur.
     SlurOff,
-    /// `0xCE`: Enable legato (suppress key-on retrigger on consecutive notes).
+    /// `0xCE <u8>`: Enable noise switch timer (`1` operand byte).
+    NoiseTimerOn(u8),
+    /// `0xCF <u8>`: Set noise switch delay (`1` operand byte).
+    NoiseTimerDelay(u8),
+    /// `0xD0`: Enable legato / roll (suppress key-on retrigger on consecutive notes).
     LegatoOn,
-    /// `0xCF`: Disable legato.
+    /// `0xD1`: Disable legato / roll.
     LegatoOff,
+    /// `0xD2 <u8>`: Enable pitch-modulation switch timer (`1` operand byte).
+    PitchModTimerOn(u8),
+    /// `0xD3 <u8>`: Set pitch-modulation switch delay (`1` operand byte).
+    PitchModTimerDelay(u8),
+    /// `0xD4`: Enable right-channel stereo phase inversion (signed negative `V_VOLR`).
+    PhaseInvertOn,
+    /// `0xD5`: Disable right-channel stereo phase inversion.
+    PhaseInvertOff,
+    /// `0xD6`: Enable alternate stereo mode flag.
+    StereoModeOn,
+    /// `0xD7`: Disable alternate stereo mode flag.
+    StereoModeOff,
     /// `0xD8 <i8>`: Set fine-tune pitch offset (signed cents-like step).
     FineTune(i8),
     /// `0xD9 <i8>`: Add signed delta to fine-tune pitch offset.
@@ -237,42 +295,122 @@ pub enum Opcode {
     PortamentoOn(u8),
     /// `0xDB`: Disable portamento glide.
     PortamentoOff,
-    /// `0xDC`: Enable right-channel stereo phase inversion (signed negative `V_VOLR`).
-    PhaseInvertOn,
-    /// `0xDD`: Disable right-channel stereo phase inversion.
-    PhaseInvertOff,
-    /// `0xDE <u8>`: Set channel expression / volume balance (`0..=127`).
-    VolumeBalance(u8),
-    /// `0xDF <i16 left> <i16 right>`: Set stereo SPU reverb return depth (`EVOLL`/`EVOLR`).
-    SetReverbDepthStereo {
-        /// Left reverb return volume (`EVOLL`).
-        left: i16,
-        /// Right reverb return volume (`EVOLR`).
-        right: i16,
+    /// `0xDC <i8>`: Adjust fixed note gate length delta (`1` operand byte).
+    FixNoteLength(i8),
+    /// `0xDD <u8 duration> <u8 target>`: Slide pitch vibrato depth (`2` operand bytes).
+    VibratoDepthSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target vibrato depth.
+        target: u8,
     },
-    /// `0xE8 <u16>`: Set sequence tempo directly (shorthand alias of extended `0x00`).
+    /// `0xDE <u8 duration> <u8 target>`: Slide volume tremolo depth (`2` operand bytes).
+    TremoloDepthSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target tremolo depth.
+        target: u8,
+    },
+    /// `0xDF <u8 duration> <u8 target>`: Slide auto-pan depth (`2` operand bytes).
+    AutoPanDepthSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target auto-pan depth.
+        target: u8,
+    },
+    /// `0xE4 <u8 duration> <u8 target>` (`V3`): Slide vibrato LFO rate (`2` operand bytes).
+    VibratoRateSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target vibrato rate.
+        target: u8,
+    },
+    /// `0xE5 <u8 duration> <u8 target>` (`V3`): Slide tremolo LFO rate (`2` operand bytes).
+    TremoloRateSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target tremolo rate.
+        target: u8,
+    },
+    /// `0xE6 <u8 duration> <u8 target>` (`V3`): Slide auto-pan LFO rate (`2` operand bytes).
+    AutoPanRateSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target auto-pan rate.
+        target: u8,
+    },
+    /// `0xE8 <u16>` (`V1`): Set sequence tempo directly.
     SetTempo(u16),
-    /// `0xE9 <u8 duration> <u16 target>`: Slide sequence tempo directly.
+    /// `0xE9 <u8 duration> <u16 target>` (`V1`): Slide sequence tempo directly.
     TempoSlide {
         /// Slide duration in musical ticks.
         duration: u8,
         /// Target 16-bit tempo value.
         target: u16,
     },
-    /// `0xEA <u8>`: Set global sequence condition variable (tested by `ConditionalJump`).
-    SetCondition(u8),
-    /// Version-prefixed extended opcode (`0xFC` on `V1`/`V2`, `0xFE` on `V3`).
+    /// `0xEA <i16 depth>` (`V1`): Set SPU reverb return depth (`EVOLL`/`EVOLR`).
+    SetReverbDepth(i16),
+    /// `0xEB <u8 duration> <i16 target>` (`V1`): Slide SPU reverb return depth.
+    ReverbDepthSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target signed 16-bit reverb depth.
+        target: i16,
+    },
+    /// `0xEC <i16 offset>` (`V1`): Enable drum mode with relative table offset.
+    DrumModeOnOffset(i16),
+    /// `0xED` (`V1`): Disable drum mode.
+    DrumModeOff,
+    /// `0xEE <i16 offset>` (`V1`): Unconditional relative jump.
+    Jump(i16),
+    /// `0xEF <u8 condition> <i16 offset>` (`V1`): Conditional relative jump.
+    ConditionalJump {
+        /// Minimum condition value required to take the jump.
+        condition: u8,
+        /// Relative signed 16-bit jump offset from the `i16` operand address.
+        offset: i16,
+    },
+    /// `0xF0 <u8 iteration> <i16 offset>` (`V1`): Loop break jump on matching iteration.
+    LoopBreak {
+        /// 1-based loop iteration count on which to break out.
+        iteration: u8,
+        /// Relative signed 16-bit jump offset.
+        offset: i16,
+    },
+    /// `0xF1 <u8 iteration> <i16 offset>` (`V1`): Alternate loop break jump.
+    LoopBreakAlt {
+        /// 1-based loop iteration count on which to break out.
+        iteration: u8,
+        /// Relative signed 16-bit jump offset.
+        offset: i16,
+    },
+    /// `0xF2 <u8>` (`V1`): Select instrument / articulation without resetting ADSR.
+    SetInstrumentAlt(u8),
+    /// `0xF6 <u8>` (`V1`): Set channel expression / volume balance (`0..=127`).
+    VolumeBalance(u8),
+    /// `0xF7 <u8 duration> <u8 target>` (`V1`): Slide channel volume balance.
+    VolumeBalanceSlide {
+        /// Slide duration in musical ticks.
+        duration: u8,
+        /// Target volume balance (`0..=127`).
+        target: u8,
+    },
+    /// `0xF8 <u8>` (`V1`): Select keysplit / bank region.
+    SetKeysplit(u8),
+    /// `0xF9` (`V1`): Reset keysplit mode.
+    ResetKeysplit,
+    /// Known 1-byte opcode consumed to preserve stream alignment.
+    Reserved1(u8, u8),
+    /// Known 2-byte opcode consumed to preserve stream alignment.
+    Reserved2(u8, u8, u8),
+    /// Version-prefixed extended opcode (`0xFC` on `V2a`/`V2b`, `0xFE` on `V3`).
     Extended(ExtendedOpcode),
     /// Unrecognized opcode byte (consumed as 1 byte).
     Unknown(u8),
 }
 
 /// Decodes a single AKAO opcode at `pc` in `data` for `version`, returning `(opcode, next_pc)`.
-pub fn decode_opcode(
-    data: &[u8],
-    pc: usize,
-    version: AkaoVersion,
-) -> Result<(Opcode, usize), Error> {
+pub fn decode_opcode(data: &[u8], pc: usize, version: AkaoVersion) -> Result<(Opcode, usize)> {
     let op = *data
         .get(pc)
         .ok_or(Error::UnexpectedEof("AKAO opcode byte"))?;
@@ -295,11 +433,12 @@ pub fn decode_opcode(
         return Ok((Opcode::Nop, cur));
     }
 
-    // Version-specific high range (0xF0..=0xFF).
-    if op >= 0xF0 {
-        return decode_high_range(data, op, cur, version);
+    // Version-divergent range (`0xE0..=0xFF`).
+    if op >= 0xE0 {
+        return decode_version_specific(data, op, cur, version);
     }
 
+    // Common range (`0xA0..=0xDF`), verified identical across V1, V2a/V2b, and V3.
     let decoded = match op {
         0xA0 => Opcode::EndOfTrack,
         0xA1 => Opcode::SetInstrument(read_u8(data, &mut cur)?),
@@ -391,47 +530,138 @@ pub fn decode_opcode(
         0xCB => Opcode::ResetVoiceModes,
         0xCC => Opcode::SlurOn,
         0xCD => Opcode::SlurOff,
-        0xCE => Opcode::LegatoOn,
-        0xCF => Opcode::LegatoOff,
+        0xCE => Opcode::NoiseTimerOn(read_u8(data, &mut cur)?),
+        0xCF => Opcode::NoiseTimerDelay(read_u8(data, &mut cur)?),
+        0xD0 => Opcode::LegatoOn,
+        0xD1 => Opcode::LegatoOff,
+        0xD2 => Opcode::PitchModTimerOn(read_u8(data, &mut cur)?),
+        0xD3 => Opcode::PitchModTimerDelay(read_u8(data, &mut cur)?),
+        0xD4 => Opcode::PhaseInvertOn,
+        0xD5 => Opcode::PhaseInvertOff,
+        0xD6 => Opcode::StereoModeOn,
+        0xD7 => Opcode::StereoModeOff,
         0xD8 => Opcode::FineTune(read_u8(data, &mut cur)? as i8),
         0xD9 => Opcode::AddFineTune(read_u8(data, &mut cur)? as i8),
         0xDA => Opcode::PortamentoOn(read_u8(data, &mut cur)?),
         0xDB => Opcode::PortamentoOff,
-        0xDC => Opcode::PhaseInvertOn,
-        0xDD => Opcode::PhaseInvertOff,
-        0xDE => Opcode::VolumeBalance(read_u8(data, &mut cur)?),
-        0xDF => {
-            let left = read_i16_le(data, &mut cur)?;
-            let right = read_i16_le(data, &mut cur)?;
-            Opcode::SetReverbDepthStereo { left, right }
-        }
-        0xE8 => Opcode::SetTempo(read_u16_le(data, &mut cur)?),
-        0xE9 => {
+        0xDC => Opcode::FixNoteLength(read_u8(data, &mut cur)? as i8),
+        0xDD => {
             let duration = read_u8(data, &mut cur)?;
-            let target = read_u16_le(data, &mut cur)?;
-            Opcode::TempoSlide { duration, target }
+            let target = read_u8(data, &mut cur)?;
+            Opcode::VibratoDepthSlide { duration, target }
         }
-        0xEA => Opcode::SetCondition(read_u8(data, &mut cur)?),
-        other => Opcode::Unknown(other),
+        0xDE => {
+            let duration = read_u8(data, &mut cur)?;
+            let target = read_u8(data, &mut cur)?;
+            Opcode::TremoloDepthSlide { duration, target }
+        }
+        0xDF => {
+            let duration = read_u8(data, &mut cur)?;
+            let target = read_u8(data, &mut cur)?;
+            Opcode::AutoPanDepthSlide { duration, target }
+        }
+        _ => Opcode::Unknown(op),
     };
 
     Ok((decoded, cur))
 }
 
-fn decode_high_range(
+fn decode_version_specific(
     data: &[u8],
     op: u8,
     mut cur: usize,
     version: AkaoVersion,
-) -> Result<(Opcode, usize), Error> {
-    if version.has_explicit_duration_opcodes() {
-        // AKAO V3 high-range opcodes:
-        // - 0xF0..=0xFB + u8 dur: explicit-duration notes
-        // - 0xFC + u8 dur: explicit-duration tie
-        // - 0xFD + u8 dur: explicit-duration rest
-        // - 0xFE + sub: extended opcode prefix (including subroutines 0x0E / 0x0F)
-        // - 0xFF: end of track alias
-        match op {
+) -> Result<(Opcode, usize)> {
+    match version {
+        AkaoVersion::V1 => {
+            let decoded = match op {
+                0xE0..=0xE7 => Opcode::EndOfTrack,
+                0xE8 => Opcode::SetTempo(read_u16_le(data, &mut cur)?),
+                0xE9 => {
+                    let duration = read_u8(data, &mut cur)?;
+                    let target = read_u16_le(data, &mut cur)?;
+                    Opcode::TempoSlide { duration, target }
+                }
+                0xEA => Opcode::SetReverbDepth(read_i16_le(data, &mut cur)?),
+                0xEB => {
+                    let duration = read_u8(data, &mut cur)?;
+                    let target = read_i16_le(data, &mut cur)?;
+                    Opcode::ReverbDepthSlide { duration, target }
+                }
+                0xEC => Opcode::DrumModeOnOffset(read_i16_le(data, &mut cur)?),
+                0xED => Opcode::DrumModeOff,
+                0xEE => Opcode::Jump(read_i16_le(data, &mut cur)?),
+                0xEF => {
+                    let condition = read_u8(data, &mut cur)?;
+                    let offset = read_i16_le(data, &mut cur)?;
+                    Opcode::ConditionalJump { condition, offset }
+                }
+                0xF0 => {
+                    let iteration = read_u8(data, &mut cur)?;
+                    let offset = read_i16_le(data, &mut cur)?;
+                    Opcode::LoopBreak { iteration, offset }
+                }
+                0xF1 => {
+                    let iteration = read_u8(data, &mut cur)?;
+                    let offset = read_i16_le(data, &mut cur)?;
+                    Opcode::LoopBreakAlt { iteration, offset }
+                }
+                0xF2 => Opcode::SetInstrumentAlt(read_u8(data, &mut cur)?),
+                0xF3 | 0xF5 => Opcode::Nop,
+                0xF4 => {
+                    let a = read_u8(data, &mut cur)?;
+                    let b = read_u8(data, &mut cur)?;
+                    Opcode::Reserved2(0xF4, a, b)
+                }
+                0xF6 => Opcode::VolumeBalance(read_u8(data, &mut cur)?),
+                0xF7 => {
+                    let duration = read_u8(data, &mut cur)?;
+                    let target = read_u8(data, &mut cur)?;
+                    Opcode::VolumeBalanceSlide { duration, target }
+                }
+                0xF8 => Opcode::SetKeysplit(read_u8(data, &mut cur)?),
+                0xF9 => Opcode::ResetKeysplit,
+                0xFA..=0xFC | 0xFF => Opcode::EndOfTrack,
+                0xFD | 0xFE => {
+                    let a = read_u8(data, &mut cur)?;
+                    let b = read_u8(data, &mut cur)?;
+                    Opcode::Reserved2(op, a, b)
+                }
+                _ => Opcode::Unknown(op),
+            };
+            Ok((decoded, cur))
+        }
+        AkaoVersion::V2a | AkaoVersion::V2b => match op {
+            0xE0 => Ok((Opcode::Nop, cur)),
+            0xE1..=0xFB | 0xFD..=0xFF => Ok((Opcode::EndOfTrack, cur)),
+            0xFC => {
+                let ext = decode_extended_v2(data, &mut cur)?;
+                Ok((Opcode::Extended(ext), cur))
+            }
+            _ => Ok((Opcode::Unknown(op), cur)),
+        },
+        AkaoVersion::V3 => match op {
+            0xE0 | 0xE2 => Ok((Opcode::Nop, cur)),
+            0xE1 => {
+                let b = read_u8(data, &mut cur)?;
+                Ok((Opcode::Reserved1(0xE1, b), cur))
+            }
+            0xE4 => {
+                let duration = read_u8(data, &mut cur)?;
+                let target = read_u8(data, &mut cur)?;
+                Ok((Opcode::VibratoRateSlide { duration, target }, cur))
+            }
+            0xE5 => {
+                let duration = read_u8(data, &mut cur)?;
+                let target = read_u8(data, &mut cur)?;
+                Ok((Opcode::TremoloRateSlide { duration, target }, cur))
+            }
+            0xE6 => {
+                let duration = read_u8(data, &mut cur)?;
+                let target = read_u8(data, &mut cur)?;
+                Ok((Opcode::AutoPanRateSlide { duration, target }, cur))
+            }
+            0xE3 | 0xE7..=0xEF | 0xFF => Ok((Opcode::EndOfTrack, cur)),
             0xF0..=0xFB => {
                 let duration = read_u8(data, &mut cur)?;
                 Ok((
@@ -451,32 +681,86 @@ fn decode_high_range(
                 Ok((Opcode::Rest { duration }, cur))
             }
             0xFE => {
-                let ext = decode_extended(data, &mut cur, version)?;
+                let ext = decode_extended_v3(data, &mut cur)?;
                 Ok((Opcode::Extended(ext), cur))
             }
-            0xFF => Ok((Opcode::EndOfTrack, cur)),
             _ => Ok((Opcode::Unknown(op), cur)),
-        }
-    } else {
-        // AKAO V1 / V2a / V2b high-range opcodes:
-        // - 0xFC + sub: extended opcode prefix
-        // - 0xFF: end of track
-        match op {
-            0xFC => {
-                let ext = decode_extended(data, &mut cur, version)?;
-                Ok((Opcode::Extended(ext), cur))
-            }
-            0xFF => Ok((Opcode::EndOfTrack, cur)),
-            _ => Ok((Opcode::Unknown(op), cur)),
-        }
+        },
     }
 }
 
-fn decode_extended(
-    data: &[u8],
-    cur: &mut usize,
-    version: AkaoVersion,
-) -> Result<ExtendedOpcode, Error> {
+fn decode_extended_v2(data: &[u8], cur: &mut usize) -> Result<ExtendedOpcode> {
+    let sub = read_u8(data, cur)?;
+    let ext = match sub {
+        0x00 => ExtendedOpcode::SetTempo(read_u16_le(data, cur)?),
+        0x01 => {
+            let duration = read_u8(data, cur)?;
+            let target = read_u16_le(data, cur)?;
+            ExtendedOpcode::TempoSlide { duration, target }
+        }
+        0x02 => ExtendedOpcode::SetReverbDepth(read_i16_le(data, cur)?),
+        0x03 => {
+            let duration = read_u8(data, cur)?;
+            let target = read_i16_le(data, cur)?;
+            ExtendedOpcode::ReverbDepthSlide { duration, target }
+        }
+        0x04 => ExtendedOpcode::DrumModeOnOffset(read_i16_le(data, cur)?),
+        0x05 => ExtendedOpcode::DrumModeOff,
+        0x06 => ExtendedOpcode::Jump(read_i16_le(data, cur)?),
+        0x07 => {
+            let condition = read_u8(data, cur)?;
+            let offset = read_i16_le(data, cur)?;
+            ExtendedOpcode::ConditionalJump { condition, offset }
+        }
+        0x08 => {
+            let iteration = read_u8(data, cur)?;
+            let offset = read_i16_le(data, cur)?;
+            ExtendedOpcode::LoopBreak { iteration, offset }
+        }
+        0x09 => {
+            let iteration = read_u8(data, cur)?;
+            let offset = read_i16_le(data, cur)?;
+            ExtendedOpcode::LoopBreakAlt { iteration, offset }
+        }
+        0x0A => ExtendedOpcode::SetInstrumentAlt(read_u8(data, cur)?),
+        0x0B => {
+            let b0 = read_u8(data, cur)?;
+            let b1 = read_u8(data, cur)?;
+            let b2 = read_u8(data, cur)?;
+            let b3 = read_u8(data, cur)?;
+            ExtendedOpcode::Reserved4(0x0B, [b0, b1, b2, b3])
+        }
+        0x0C | 0x14 | 0x18 => {
+            let a = read_u8(data, cur)?;
+            let b = read_u8(data, cur)?;
+            ExtendedOpcode::Reserved2(sub, a, b)
+        }
+        0x0E => ExtendedOpcode::VolumeBalance(read_u8(data, cur)?),
+        0x0F => {
+            let duration = read_u8(data, cur)?;
+            let target = read_u8(data, cur)?;
+            ExtendedOpcode::VolumeBalanceSlide { duration, target }
+        }
+        0x10 => ExtendedOpcode::SetKeysplit(read_u8(data, cur)?),
+        0x11 => ExtendedOpcode::ResetKeysplit,
+        0x12 => {
+            let duration = read_u8(data, cur)?;
+            let target = read_u8(data, cur)?;
+            ExtendedOpcode::MasterVolumeSlide { duration, target }
+        }
+        0x15 => {
+            let a = read_u8(data, cur)?;
+            let b = read_u8(data, cur)?;
+            ExtendedOpcode::TimeSignature(a, b)
+        }
+        0x16 => ExtendedOpcode::MeasureNumber(read_u16_le(data, cur)?),
+        0x17 => ExtendedOpcode::Reserved1(0x17, read_u8(data, cur)?),
+        other => ExtendedOpcode::Unknown(other),
+    };
+    Ok(ext)
+}
+
+fn decode_extended_v3(data: &[u8], cur: &mut usize) -> Result<ExtendedOpcode> {
     let sub = read_u8(data, cur)?;
     let ext = match sub {
         0x00 => ExtendedOpcode::SetTempo(read_u16_le(data, cur)?),
@@ -509,17 +793,37 @@ fn decode_extended(
             let offset = read_i16_le(data, cur)?;
             ExtendedOpcode::LoopBreakAlt { iteration, offset }
         }
-        0x0E if version.supports_subroutines() => {
-            ExtendedOpcode::SubroutineCall(read_i16_le(data, cur)?)
+        0x0A => ExtendedOpcode::SetInstrumentAlt(read_u8(data, cur)?),
+        0x0B | 0x1C => ExtendedOpcode::Reserved1(sub, read_u8(data, cur)?),
+        0x0E => ExtendedOpcode::SubroutineCall(read_i16_le(data, cur)?),
+        0x0F => ExtendedOpcode::SubroutineReturn,
+        0x10 => ExtendedOpcode::SetKeysplit(read_u8(data, cur)?),
+        0x11 => ExtendedOpcode::ResetKeysplit,
+        0x12 => {
+            let duration = read_u8(data, cur)?;
+            let target = read_u8(data, cur)?;
+            ExtendedOpcode::MasterVolumeSlide { duration, target }
         }
-        0x0F if version.supports_subroutines() => ExtendedOpcode::SubroutineReturn,
+        0x14 => ExtendedOpcode::SelectKeysplitInstrument(read_u8(data, cur)?),
+        0x15 => {
+            let a = read_u8(data, cur)?;
+            let b = read_u8(data, cur)?;
+            ExtendedOpcode::TimeSignature(a, b)
+        }
+        0x16 => ExtendedOpcode::MeasureNumber(read_u16_le(data, cur)?),
+        0x19 => {
+            let b0 = read_u8(data, cur)?;
+            let b1 = read_u8(data, cur)?;
+            let b2 = read_u8(data, cur)?;
+            ExtendedOpcode::Reserved3(0x19, [b0, b1, b2])
+        }
         other => ExtendedOpcode::Unknown(other),
     };
     Ok(ext)
 }
 
 #[inline]
-fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, Error> {
+fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8> {
     let b = *data
         .get(*cur)
         .ok_or(Error::UnexpectedEof("AKAO opcode operand"))?;
@@ -528,13 +832,13 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, Error> {
 }
 
 #[inline]
-fn read_u16_le(data: &[u8], cur: &mut usize) -> Result<u16, Error> {
+fn read_u16_le(data: &[u8], cur: &mut usize) -> Result<u16> {
     let lo = read_u8(data, cur)?;
     let hi = read_u8(data, cur)?;
     Ok(u16::from_le_bytes([lo, hi]))
 }
 
 #[inline]
-fn read_i16_le(data: &[u8], cur: &mut usize) -> Result<i16, Error> {
+fn read_i16_le(data: &[u8], cur: &mut usize) -> Result<i16> {
     Ok(read_u16_le(data, cur)? as i16)
 }

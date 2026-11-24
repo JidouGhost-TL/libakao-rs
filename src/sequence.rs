@@ -1,12 +1,18 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! AKAO sequence header, channel table, and V3 embedded drum/keysplit table parser.
+//!
+//! [`AkaoSequenceView`] provides zero-allocation borrowed parsing usable in pure
+//! `#![no_std]` environments without `alloc`. With the `alloc` feature enabled,
+//! [`AkaoSequence`] provides an owned representation.
 
+#[cfg(feature = "alloc")]
 use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::version::{detect_version, AkaoVersion};
-use crate::Error;
+use crate::{Error, Result};
 
 /// Four-byte ASCII magic signature at the start of every AKAO sequence (`"AKAO"`).
 pub const AKAO_MAGIC: [u8; 4] = *b"AKAO";
@@ -28,6 +34,22 @@ pub struct DrumEntry {
     pub pan: u8,
 }
 
+impl DrumEntry {
+    /// Decodes an 8-byte `V3` drum entry from a raw slice.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes(chunk: &[u8; 8]) -> Self {
+        Self {
+            articulation_index: chunk[0],
+            note: chunk[1],
+            adsr1: u16::from_le_bytes([chunk[2], chunk[3]]),
+            adsr2: u16::from_le_bytes([chunk[4], chunk[5]]),
+            volume: chunk[6],
+            pan: chunk[7],
+        }
+    }
+}
+
 /// An 8-byte AKAO `V3` embedded custom keysplit / articulation entry (pointed to by header `+0x34`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeysplitEntry {
@@ -45,9 +67,27 @@ pub struct KeysplitEntry {
     pub adsr2: u16,
 }
 
-/// Parsed AKAO music sequence across all supported PlayStation 1 generations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AkaoSequence {
+impl KeysplitEntry {
+    /// Decodes an 8-byte `V3` keysplit entry from a raw slice.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes(chunk: &[u8; 8]) -> Self {
+        Self {
+            articulation_index: chunk[0],
+            low_note: chunk[1],
+            high_note: chunk[2],
+            base_note: chunk[3],
+            adsr1: u16::from_le_bytes([chunk[4], chunk[5]]),
+            adsr2: u16::from_le_bytes([chunk[6], chunk[7]]),
+        }
+    }
+}
+
+/// Zero-allocation borrowed view of a parsed AKAO music sequence header and tables.
+///
+/// Usable in pure `#![no_std]` builds without the `alloc` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AkaoSequenceView<'a> {
     /// Sequence generation (`V1`, `V2a`, `V2b`, or `V3`).
     pub version: AkaoVersion,
     /// Song identifier from header `+0x04`.
@@ -66,22 +106,20 @@ pub struct AkaoSequence {
     pub rhythm_mask: u32,
     /// Secondary / alternate channel bitmask (`V2` `+0x18`, `V3` `+0x28`, `0` on `V1`).
     pub secondary_mask: u32,
-    /// Absolute byte offset in [`Self::data`] for each channel slot (`None` if inactive).
-    pub channel_starts: Vec<Option<usize>>,
-    /// Embedded `V3` 8-byte drum map entries (empty if absent or `V1`/`V2`).
-    pub drum_table: Vec<DrumEntry>,
-    /// Embedded `V3` 8-byte keysplit entries (empty if absent or `V1`/`V2`).
-    pub keysplit_table: Vec<KeysplitEntry>,
-    /// Raw sequence bytes.
-    pub data: Vec<u8>,
+    channel_starts: [Option<usize>; 32],
+    drum_region: &'a [u8],
+    drum_count: usize,
+    keysplit_region: &'a [u8],
+    keysplit_count: usize,
+    data: &'a [u8],
 }
 
-impl AkaoSequence {
-    /// Parses an AKAO sequence from `bytes`.
+impl<'a> AkaoSequenceView<'a> {
+    /// Parses a borrowed AKAO sequence view from `bytes` without allocating.
     ///
     /// Pass `Some(version)` to force a specific [`AkaoVersion`], or `None` to
     /// auto-detect via [`detect_version`].
-    pub fn parse(bytes: &[u8], version: Option<AkaoVersion>) -> Result<Self, Error> {
+    pub fn parse(bytes: &'a [u8], version: Option<AkaoVersion>) -> Result<Self> {
         let version = match version {
             Some(v) => v,
             None => detect_version(bytes)?,
@@ -137,11 +175,11 @@ impl AkaoSequence {
         }
 
         let max_ch = version.max_channels();
-        let mut channel_starts = vec![None; max_ch];
+        let mut channel_starts = [None; 32];
         let mut entry_idx = 0usize;
         let mut min_channel_start = bytes.len();
 
-        for (ch, slot) in channel_starts.iter_mut().enumerate() {
+        for (ch, slot) in channel_starts[..max_ch].iter_mut().enumerate() {
             if (channel_mask & (1u32 << ch)) == 0 {
                 continue;
             }
@@ -149,12 +187,10 @@ impl AkaoSequence {
             entry_idx += 1;
             let rel = read_u16_le(bytes, entry_addr) as usize;
             let abs = if version.uses_self_relative_offsets() {
-                // AKAO V3: self-relative (`0x40 + idx * 2 + val`).
                 entry_addr
                     .checked_add(rel)
                     .ok_or(Error::OutOfRange("channel start offset overflow"))?
             } else {
-                // AKAO V1/V2a/V2b: post-entry relative (`entry_addr + 2 + val`).
                 entry_addr
                     .checked_add(2)
                     .and_then(|base| base.checked_add(rel))
@@ -169,8 +205,10 @@ impl AkaoSequence {
             *slot = Some(abs);
         }
 
-        let mut drum_table = Vec::new();
-        let mut keysplit_table = Vec::new();
+        let mut drum_region: &'a [u8] = &[];
+        let mut drum_count = 0usize;
+        let mut keysplit_region: &'a [u8] = &[];
+        let mut keysplit_count = 0usize;
 
         if version == AkaoVersion::V3 {
             let drum_rel = read_i32_le(bytes, 0x30);
@@ -194,11 +232,13 @@ impl AkaoSequence {
 
             if let Some(start) = drum_addr {
                 let end = table_region_end(start, art_addr, min_channel_start, bytes.len());
-                parse_drum_table(&bytes[start..end], &mut drum_table);
+                drum_region = &bytes[start..end];
+                drum_count = count_table_entries(drum_region);
             }
             if let Some(start) = art_addr {
                 let end = table_region_end(start, drum_addr, min_channel_start, bytes.len());
-                parse_keysplit_table(&bytes[start..end], &mut keysplit_table);
+                keysplit_region = &bytes[start..end];
+                keysplit_count = count_table_entries(keysplit_region);
             }
         }
 
@@ -213,10 +253,158 @@ impl AkaoSequence {
             rhythm_mask,
             secondary_mask,
             channel_starts,
+            drum_region,
+            drum_count,
+            keysplit_region,
+            keysplit_count,
+            data: bytes,
+        })
+    }
+
+    /// Returns the number of active channels in this sequence.
+    #[inline]
+    #[must_use]
+    pub const fn active_channel_count(&self) -> usize {
+        self.channel_mask.count_ones() as usize
+    }
+
+    /// Returns the absolute byte start offset for `channel`, or `None` if inactive/out of range.
+    #[inline]
+    #[must_use]
+    pub const fn channel_start(&self, channel: usize) -> Option<usize> {
+        if channel < self.version.max_channels() {
+            self.channel_starts[channel]
+        } else {
+            None
+        }
+    }
+
+    /// Returns the number of embedded `V3` drum entries.
+    #[inline]
+    #[must_use]
+    pub const fn drum_count(&self) -> usize {
+        self.drum_count
+    }
+
+    /// Decodes the embedded `V3` [`DrumEntry`] at `index`, or `None` if out of bounds.
+    #[inline]
+    #[must_use]
+    pub fn drum_entry(&self, index: usize) -> Option<DrumEntry> {
+        if index >= self.drum_count {
+            return None;
+        }
+        let off = index * 8;
+        let chunk: [u8; 8] = self.drum_region[off..off + 8].try_into().ok()?;
+        Some(DrumEntry::from_bytes(&chunk))
+    }
+
+    /// Returns the number of embedded `V3` keysplit entries.
+    #[inline]
+    #[must_use]
+    pub const fn keysplit_count(&self) -> usize {
+        self.keysplit_count
+    }
+
+    /// Decodes the embedded `V3` [`KeysplitEntry`] at `index`, or `None` if out of bounds.
+    #[inline]
+    #[must_use]
+    pub fn keysplit_entry(&self, index: usize) -> Option<KeysplitEntry> {
+        if index >= self.keysplit_count {
+            return None;
+        }
+        let off = index * 8;
+        let chunk: [u8; 8] = self.keysplit_region[off..off + 8].try_into().ok()?;
+        Some(KeysplitEntry::from_bytes(&chunk))
+    }
+
+    /// Returns the underlying raw sequence slice.
+    #[inline]
+    #[must_use]
+    pub const fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Converts this borrowed view into an owned [`AkaoSequence`].
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn to_owned_sequence(&self) -> AkaoSequence {
+        let max_ch = self.version.max_channels();
+        let mut channel_starts = vec![None; max_ch];
+        channel_starts.copy_from_slice(&self.channel_starts[..max_ch]);
+
+        let mut drum_table = Vec::with_capacity(self.drum_count);
+        for i in 0..self.drum_count {
+            if let Some(entry) = self.drum_entry(i) {
+                drum_table.push(entry);
+            }
+        }
+
+        let mut keysplit_table = Vec::with_capacity(self.keysplit_count);
+        for i in 0..self.keysplit_count {
+            if let Some(entry) = self.keysplit_entry(i) {
+                keysplit_table.push(entry);
+            }
+        }
+
+        AkaoSequence {
+            version: self.version,
+            song_id: self.song_id,
+            declared_length: self.declared_length,
+            reverb_type: self.reverb_type,
+            initial_volume: self.initial_volume,
+            header_param: self.header_param,
+            channel_mask: self.channel_mask,
+            rhythm_mask: self.rhythm_mask,
+            secondary_mask: self.secondary_mask,
+            channel_starts,
             drum_table,
             keysplit_table,
-            data: bytes.to_vec(),
-        })
+            data: self.data.to_vec(),
+        }
+    }
+}
+
+/// Owned parsed AKAO music sequence across all supported PlayStation 1 generations.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AkaoSequence {
+    /// Sequence generation (`V1`, `V2a`, `V2b`, or `V3`).
+    pub version: AkaoVersion,
+    /// Song identifier from header `+0x04`.
+    pub song_id: u16,
+    /// Declared payload length from header `+0x06`.
+    pub declared_length: u16,
+    /// Reverb preset / mode identifier from header `+0x08`.
+    pub reverb_type: u16,
+    /// Initial sequence volume field (`V3` `+0x10`, `0` on `V1`/`V2`).
+    pub initial_volume: u32,
+    /// Additional sequence parameter field (`V3` `+0x14`, `0` on `V1`/`V2`).
+    pub header_param: u32,
+    /// Active channel bitmask (`24` bits on `V1`/`V2`, `32` bits on `V3`).
+    pub channel_mask: u32,
+    /// Rhythm / percussion channel bitmask (`V2` `+0x14`, `V3` `+0x24`, `0` on `V1`).
+    pub rhythm_mask: u32,
+    /// Secondary / alternate channel bitmask (`V2` `+0x18`, `V3` `+0x28`, `0` on `V1`).
+    pub secondary_mask: u32,
+    /// Absolute byte offset in [`Self::data`] for each channel slot (`None` if inactive).
+    pub channel_starts: Vec<Option<usize>>,
+    /// Embedded `V3` 8-byte drum map entries (empty if absent or `V1`/`V2`).
+    pub drum_table: Vec<DrumEntry>,
+    /// Embedded `V3` 8-byte keysplit entries (empty if absent or `V1`/`V2`).
+    pub keysplit_table: Vec<KeysplitEntry>,
+    /// Raw sequence bytes.
+    pub data: Vec<u8>,
+}
+
+#[cfg(feature = "alloc")]
+impl AkaoSequence {
+    /// Parses an AKAO sequence from `bytes`.
+    ///
+    /// Pass `Some(version)` to force a specific [`AkaoVersion`], or `None` to
+    /// auto-detect via [`detect_version`].
+    pub fn parse(bytes: &[u8], version: Option<AkaoVersion>) -> Result<Self> {
+        let view = AkaoSequenceView::parse(bytes, version)?;
+        Ok(view.to_owned_sequence())
     }
 
     /// Returns the number of active channels in this sequence.
@@ -239,7 +427,7 @@ fn resolve_v3_rel_offset(
     rel: i32,
     min_addr: usize,
     len: usize,
-) -> Result<usize, Error> {
+) -> Result<usize> {
     let target = (field_offset as i64) + i64::from(rel);
     if target < min_addr as i64 || target as usize >= len {
         return Err(Error::OutOfRange("V3 embedded table offset out of bounds"));
@@ -265,37 +453,15 @@ fn table_region_end(
     end
 }
 
-fn parse_drum_table(region: &[u8], out: &mut Vec<DrumEntry>) {
+fn count_table_entries(region: &[u8]) -> usize {
+    let mut count = 0usize;
     for chunk in region.chunks_exact(8) {
-        // Stop at an all-0xFF or all-zero terminator if encountered after entries.
-        if chunk == [0xFF; 8] || (chunk == [0x00; 8] && !out.is_empty()) {
+        if chunk == [0xFF; 8] || (chunk == [0x00; 8] && count > 0) {
             break;
         }
-        out.push(DrumEntry {
-            articulation_index: chunk[0],
-            note: chunk[1],
-            adsr1: u16::from_le_bytes([chunk[2], chunk[3]]),
-            adsr2: u16::from_le_bytes([chunk[4], chunk[5]]),
-            volume: chunk[6],
-            pan: chunk[7],
-        });
+        count += 1;
     }
-}
-
-fn parse_keysplit_table(region: &[u8], out: &mut Vec<KeysplitEntry>) {
-    for chunk in region.chunks_exact(8) {
-        if chunk == [0xFF; 8] || (chunk == [0x00; 8] && !out.is_empty()) {
-            break;
-        }
-        out.push(KeysplitEntry {
-            articulation_index: chunk[0],
-            low_note: chunk[1],
-            high_note: chunk[2],
-            base_note: chunk[3],
-            adsr1: u16::from_le_bytes([chunk[4], chunk[5]]),
-            adsr2: u16::from_le_bytes([chunk[6], chunk[7]]),
-        });
-    }
+    count
 }
 
 #[inline]

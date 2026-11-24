@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! AKAO sequencer generation metadata, hardware timer rates, and version auto-detection.
 
 use crate::sequence::AKAO_MAGIC;
-use crate::Error;
+use crate::{Error, Result};
 
 /// PlayStation 1 Root Counter 2 input clock (`SysClk / 8` = `4,233,600 Hz`).
 pub const PS1_ROOT_COUNTER_2_CLOCK_HZ: f64 = 4_233_600.0;
@@ -147,7 +147,7 @@ impl AkaoVersion {
 /// Because `V2a` and `V2b` share an identical sequence header geometry (`0x20` header,
 /// 24 channels, post-entry offsets, `0xFC` prefix), `detect_version` reports [`AkaoVersion::V2a`]
 /// for generation-2 sequences unless the caller explicitly specifies [`AkaoVersion::V2b`].
-pub fn detect_version(bytes: &[u8]) -> Result<AkaoVersion, Error> {
+pub fn detect_version(bytes: &[u8]) -> Result<AkaoVersion> {
     if bytes.len() < 0x14 {
         return Err(Error::UnexpectedEof("AKAO sequence header"));
     }

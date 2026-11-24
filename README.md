@@ -11,7 +11,7 @@ pure-Rust PlayStation 1 **AKAO** music sequencer built directly on top of
 
 | Version | Header Size | Channels | Channel Offsets | Root Counter 2 Timer | Wave Bank Entry | Extended Prefix |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`V1`** | `0x14` | 24 | Post-entry relative (`entry + 2 + val`) | `243.8569 Hz` (`4,233,600 / 17,361`) | 64 B (max 128) | `0xFC` |
+| **`V1`** | `0x14` | 24 | Post-entry relative (`entry + 2 + val`) | `243.8569 Hz` (`4,233,600 / 17,361`) | 64 B (max 128) | Direct `0xE8..0xFE` |
 | **`V2a`** | `0x20` | 24 | Post-entry relative (`entry + 2 + val`) | `240.0000 Hz` (`4,233,600 / 17,640`) | 64 B (max 128) | `0xFC` |
 | **`V2b`** | `0x20` | 24 | Post-entry relative (`entry + 2 + val`) | `240.0000 Hz` (`4,233,600 / 17,640`) | 64 B (max 256, relocatable) | `0xFC` |
 | **`V3`** | `0x40` | 32 | Self-relative (`0x40 + idx * 2 + val`) | `240.0000 Hz` (`4,233,600 / 17,640`) | 16 B (relocatable) + embedded 8 B drum/keysplit tables | `0xFE` (`0xF0..0xFD` explicit durations, `0xFE 0x0E`/`0x0F` subroutines) |
@@ -80,4 +80,4 @@ assert!(rendered.samples.iter().any(|&s| s != 0));
 
 ## License
 
-MIT (`LICENSE`).
+Dual-licensed under MIT (`LICENSE-MIT`) or Apache-2.0 (`LICENSE-APACHE`), at your option.
