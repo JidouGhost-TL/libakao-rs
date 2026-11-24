@@ -289,7 +289,7 @@ fn wave_bank_parsing_64b_vs_16b_relocation_and_spu_upload() {
 
 #[test]
 fn opcode_decoder_handles_v1_v2_vs_v3_operand_lengths() {
-    // Common 0xCE..0xDF exact operand lengths (verified from FF7/PE/CC Ghidra):
+    // Common 0xCE..0xDF exact operand lengths:
     // 0xCE (1B), 0xCF (1B), 0xD0 (0B), 0xD2 (1B), 0xD3 (1B), 0xD4 (0B),
     // 0xDC (1B), 0xDD (2B), 0xDE (2B), 0xDF (2B)
     let common_stream = [
