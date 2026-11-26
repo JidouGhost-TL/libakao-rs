@@ -88,6 +88,42 @@ pub struct AkaoWaveBankView<'a> {
 }
 
 impl<'a> AkaoWaveBankView<'a> {
+    /// Returns `true` if `bytes` has a structurally valid 64-byte unified `"AKAO"` wave bank
+    /// header (`declared_length == 0`, zero reserved block `+0x20..+0x40`, 16-byte-aligned
+    /// `spu_base_addr` and non-zero `adpcm_len` within PS1 SPU RAM, and 16-byte-aligned
+    /// articulation table region).
+    #[must_use]
+    pub fn is_unified_header(bytes: &[u8]) -> bool {
+        if bytes.len() < WAVE_BANK_HEADER_SIZE + 0x20 {
+            return false;
+        }
+        if bytes[0..4] != AKAO_MAGIC {
+            return false;
+        }
+        let decl = u16::from_le_bytes([bytes[6], bytes[7]]);
+        if decl != 0 {
+            return false;
+        }
+        if bytes[0x20..WAVE_BANK_HEADER_SIZE].iter().any(|&b| b != 0) {
+            return false;
+        }
+        let spu_base_addr = read_u32_le(bytes, 0x10);
+        let adpcm_len = read_u32_le(bytes, 0x14) as usize;
+        if (spu_base_addr & 0xF) != 0 || spu_base_addr as usize >= libspu2::PS1_RAM_SIZE {
+            return false;
+        }
+        if adpcm_len == 0 || (adpcm_len & 0xF) != 0 || adpcm_len >= bytes.len() {
+            return false;
+        }
+        let Some(table_end) = bytes.len().checked_sub(adpcm_len) else {
+            return false;
+        };
+        if table_end <= WAVE_BANK_HEADER_SIZE || (table_end & 0xF) != 0 {
+            return false;
+        }
+        validate_spu_range(spu_base_addr, adpcm_len).is_ok()
+    }
+
     /// Parses a borrowed AKAO wave bank view for `version` without allocating.
     pub fn parse(bytes: &'a [u8], version: AkaoVersion) -> Result<Self> {
         match version {

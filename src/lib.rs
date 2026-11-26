@@ -18,6 +18,7 @@ pub mod opcodes;
 pub mod player;
 pub mod reverb;
 pub mod sequence;
+pub mod sfx;
 pub mod version;
 
 #[cfg(feature = "alloc")]
@@ -30,6 +31,9 @@ pub use reverb::{ReverbParams, ReverbPreset};
 #[cfg(feature = "alloc")]
 pub use sequence::AkaoSequence;
 pub use sequence::{AkaoSequenceView, DrumEntry, KeysplitEntry, AKAO_MAGIC};
+#[cfg(feature = "alloc")]
+pub use sfx::AkaoSfxBank;
+pub use sfx::{AkaoSfxBankView, SFX_BANK_HEADER_SIZE, SFX_UNUSED_SLOT};
 pub use version::{detect_version, AkaoVersion, PS1_ROOT_COUNTER_2_CLOCK_HZ};
 
 /// Crate-wide result type alias for `libakao`.
@@ -91,6 +95,7 @@ const _: () = {
     assert_send_sync::<AkaoVersion>();
     assert_send_sync::<AkaoSequenceView<'static>>();
     assert_send_sync::<AkaoWaveBankView<'static>>();
+    assert_send_sync::<AkaoSfxBankView<'static>>();
     assert_send_sync::<DrumEntry>();
     assert_send_sync::<KeysplitEntry>();
     assert_send_sync::<Articulation>();
@@ -102,6 +107,7 @@ const _: () = {
     {
         assert_send_sync::<AkaoSequence>();
         assert_send_sync::<AkaoWaveBank>();
+        assert_send_sync::<AkaoSfxBank>();
         assert_send_sync::<FadeCurve>();
         assert_send_sync::<RenderConfig>();
         assert_send_sync::<RenderResult>();

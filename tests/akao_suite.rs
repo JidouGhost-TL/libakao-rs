@@ -1124,3 +1124,102 @@ fn error_validation_rejects_malformed_inputs() {
     );
     assert_eq!(detect_version(&empty_mask), Err(Error::UnknownVersion));
 }
+
+#[test]
+fn single_track_zero_relative_offset_and_unified_bank_header_probe() {
+    // Single-track V1 sequence where rel == 0 points immediately after the 2-byte table entry.
+    let mut seq = Vec::new();
+    seq.extend_from_slice(b"AKAO");
+    seq.extend_from_slice(&1u16.to_le_bytes()); // song_id
+    seq.extend_from_slice(&8u16.to_le_bytes()); // declared_length = len - 16
+    seq.extend_from_slice(&0u16.to_le_bytes()); // reverb
+    seq.extend_from_slice(&[0u8; 6]);
+    seq.extend_from_slice(&1u32.to_le_bytes()); // channel_mask = bit 0
+    seq.extend_from_slice(&0u16.to_le_bytes()); // rel offset = 0 -> abs 0x16
+    seq.extend_from_slice(&[0xA0, 0xFF]); // halt + pad
+
+    assert_eq!(detect_version(&seq).unwrap(), AkaoVersion::V1);
+    let parsed = AkaoSequenceView::parse(&seq, None).unwrap();
+    assert_eq!(parsed.active_channel_count(), 1);
+    assert_eq!(parsed.channel_start(0), Some(0x16));
+    assert!(!AkaoWaveBankView::is_unified_header(&seq));
+
+    // Unified decl==0 wave bank header detection distinguishes banks from sequences.
+    let mut bank = vec![0u8; libakao::WAVE_BANK_HEADER_SIZE];
+    bank[0..4].copy_from_slice(b"AKAO");
+    bank[0x10..0x14].copy_from_slice(&0x1010u32.to_le_bytes());
+    bank[0x14..0x18].copy_from_slice(&0x20u32.to_le_bytes()); // 32 bytes ADPCM
+    bank[0x18..0x1C].copy_from_slice(&0u32.to_le_bytes());
+    bank[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+    bank.extend_from_slice(&[0u8; 64]); // 1 x 64B articulation
+    bank.extend_from_slice(&[0u8; 32]); // 32B ADPCM
+    assert!(AkaoWaveBankView::is_unified_header(&bank));
+    let wb = AkaoWaveBankView::parse(&bank, AkaoVersion::V2a).unwrap();
+    assert_eq!(wb.articulation_count(), 1);
+    assert_eq!(wb.adpcm_data().len(), 32);
+
+    // Non-zero declared_length must not match unified wave bank probe.
+    let mut bad_bank = bank.clone();
+    bad_bank[6..8].copy_from_slice(&0x10u16.to_le_bytes());
+    assert!(!AkaoWaveBankView::is_unified_header(&bad_bank));
+}
+
+#[test]
+fn sfx_offset_table_bank_with_and_without_attributes() {
+    use libakao::{AkaoSfxBank, AkaoSfxBankView, SFX_UNUSED_SLOT};
+
+    // Case 1: With per-slot attribute table (2 unused leading slots + 3 active slots + 1 unused).
+    let mut buf = vec![0u8; 0x10];
+    buf[0..4].copy_from_slice(b"AKAO");
+    let offsets: [u16; 6] = [SFX_UNUSED_SLOT, SFX_UNUSED_SLOT, 0, 4, 9, SFX_UNUSED_SLOT];
+    for off in offsets {
+        buf.extend_from_slice(&off.to_le_bytes());
+    }
+    // 6-byte attribute table: 0 for unused slots, small channel flags for active slots.
+    buf.extend_from_slice(&[0, 0, 1, 2, 1, 0]);
+    // Payload: 3 AKAO SFX sequences ending in 0xA0.
+    let sfx0 = [0xA1, 0x01, 0x05, 0xA0];
+    let sfx1 = [0xA8, 0x40, 0xA1, 0x02, 0xA0];
+    let sfx2 = [0xC6, 0xA0];
+    buf.extend_from_slice(&sfx0);
+    buf.extend_from_slice(&sfx1);
+    buf.extend_from_slice(&sfx2);
+
+    assert!(AkaoSfxBankView::identifies(&buf));
+    let view = AkaoSfxBankView::parse(&buf).unwrap();
+    assert_eq!(view.slot_count(), 6);
+    assert_eq!(view.active_count(), 3);
+    assert_eq!(view.slot_offset(0), None);
+    assert_eq!(view.slot_offset(2), Some(0));
+    assert_eq!(view.slot_attribute(2), Some(1));
+    assert_eq!(view.slot_attribute(3), Some(2));
+    assert_eq!(view.slot_bytes(2), Some(sfx0.as_slice()));
+    assert_eq!(view.slot_bytes(3), Some(sfx1.as_slice()));
+    assert_eq!(view.slot_bytes(4), Some(sfx2.as_slice()));
+    assert_eq!(view.slot_bytes(5), None);
+
+    let owned = AkaoSfxBank::parse(&buf).unwrap();
+    assert_eq!(owned.active_count, 3);
+    assert_eq!(owned.slot_bytes(3), Some(sfx1.as_slice()));
+
+    // Case 2: Without attribute table (pure u16 table + payload).
+    let mut plain = vec![0u8; 0x10];
+    plain[0..4].copy_from_slice(b"AKAO");
+    for off in [0u16, 3u16] {
+        plain.extend_from_slice(&off.to_le_bytes());
+    }
+    plain.extend_from_slice(&[0xA1, 0x00, 0xA0, 0xA8, 0x7F, 0xA0]);
+    let view2 = AkaoSfxBankView::parse(&plain).unwrap();
+    assert_eq!(view2.slot_count(), 2);
+    assert_eq!(view2.active_count(), 2);
+    assert_eq!(view2.slot_attribute(0), None);
+    assert_eq!(view2.slot_bytes(0), Some(&[0xA1, 0x00, 0xA0][..]));
+    assert_eq!(view2.slot_bytes(1), Some(&[0xA8, 0x7F, 0xA0][..]));
+
+    // Malformed / non-zero header rejected.
+    let mut bad = buf.clone();
+    bad[4] = 1;
+    assert!(!AkaoSfxBankView::identifies(&bad));
+    assert!(AkaoSfxBankView::parse(&bad).is_err());
+    assert!(AkaoSfxBankView::parse(b"NOPE00000000000000000000").is_err());
+}
