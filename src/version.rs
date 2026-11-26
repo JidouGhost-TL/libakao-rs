@@ -15,7 +15,7 @@ pub const V1_TIMER_DIVIDER: u32 = 17_361;
 pub const V2_V3_TIMER_DIVIDER: u32 = 17_640;
 
 /// Supported PlayStation 1 AKAO sequencer generations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AkaoVersion {
     /// Generation 1 (`0x14` header, 24 channels, post-entry offsets, `243.8569 Hz` timer, 64 B bank entries, `0xFC` extended prefix).
     V1,

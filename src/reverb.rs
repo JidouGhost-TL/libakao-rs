@@ -2,8 +2,13 @@
 
 //! PlayStation 1 SPU hardware reverb presets and register parameter blocks.
 
+use libspu2::registers::{ps1, CONTROL_ENABLE, CONTROL_REVERB, CONTROL_UNMUTE};
+use libspu2::{Device, PS1_RAM_SIZE};
+
+use crate::Result;
+
 /// The 10 standard PlayStation 1 SPU hardware reverb presets (`0..=9`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReverbPreset {
     /// Reverb disabled (`0` bytes work area).
     #[default]
@@ -392,6 +397,75 @@ impl ReverbPreset {
                 v_rin: 0x8000_u16 as i16,
             },
         }
+    }
+
+    /// Programs this preset into a PS1-mode [`libspu2::Device`].
+    ///
+    /// Places the reverb work area at the top of 512 KiB PS1 SPU RAM if it does
+    /// not overlap `ram_used_end`, zeros the work area so prior echoes cannot
+    /// bleed across resets, writes all 32 reverb registers, and updates
+    /// `RVB_WORK_ADDR`, `SPUCNT`, `EVOLL`, and `EVOLR`.
+    ///
+    /// Returns `Ok(true)` if hardware reverb is active after configuration, or
+    /// `Ok(false)` if disabled (`Off` or insufficient free SPU RAM).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Spu`](crate::Error::Spu) if writing PS1 SPU reverb
+    /// registers or clearing the SPU RAM work area fails.
+    pub fn apply(
+        self,
+        device: &mut Device,
+        depth_left: i16,
+        depth_right: i16,
+        ram_used_end: usize,
+    ) -> Result<bool> {
+        let work_size = self.work_area_size() as usize;
+        let work_start = PS1_RAM_SIZE.saturating_sub(work_size) & !7;
+        let active = self != Self::Off && work_size > 0 && work_start >= ram_used_end;
+
+        let params = if active {
+            self.params()
+        } else {
+            ReverbParams::ZERO
+        };
+        let regs = params.to_ps1_registers();
+        for (idx, &word) in regs.iter().enumerate() {
+            device.write_ps1_register(ps1::RVB_BASE + (idx as u32) * 2, word)?;
+        }
+
+        if active {
+            // Clear reverb work area so repeated runs / resets start silent.
+            let zeros = [0u8; 256];
+            let mut offset = work_start;
+            while offset < PS1_RAM_SIZE {
+                let chunk = (PS1_RAM_SIZE - offset).min(zeros.len());
+                device.write_ram(offset as u32, &zeros[..chunk])?;
+                offset += chunk;
+            }
+        }
+
+        let work_addr_reg = if active {
+            (work_start >> 3) as u16
+        } else {
+            ((PS1_RAM_SIZE - 8) >> 3) as u16
+        };
+        device.write_ps1_register(ps1::RVB_WORK_ADDR, work_addr_reg)?;
+
+        let mut cnt = CONTROL_ENABLE | CONTROL_UNMUTE;
+        if active {
+            cnt |= CONTROL_REVERB;
+        }
+        device.write_ps1_register(ps1::SPUCNT, cnt)?;
+
+        let (dl, dr) = if active {
+            (depth_left, depth_right)
+        } else {
+            (0, 0)
+        };
+        device.write_ps1_register(ps1::EVOLL, dl as u16)?;
+        device.write_ps1_register(ps1::EVOLR, dr as u16)?;
+        Ok(active)
     }
 }
 

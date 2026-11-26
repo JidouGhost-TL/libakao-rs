@@ -4,7 +4,7 @@
 //!
 //! [`AkaoSequenceView`] provides zero-allocation borrowed parsing usable in pure
 //! `#![no_std]` environments without `alloc`. With the `alloc` feature enabled,
-//! [`AkaoSequence`] provides an owned representation.
+//! `AkaoSequence` provides an owned representation.
 
 #[cfg(feature = "alloc")]
 use alloc::vec;
@@ -405,6 +405,32 @@ impl AkaoSequence {
     pub fn parse(bytes: &[u8], version: Option<AkaoVersion>) -> Result<Self> {
         let view = AkaoSequenceView::parse(bytes, version)?;
         Ok(view.to_owned_sequence())
+    }
+
+    /// Wraps a raw single-channel AKAO SFX bytecode slice into a playable 1-channel [`AkaoSequence`].
+    ///
+    /// Relative jumps inside `slot_bytes` resolve directly against offset `0`.
+    pub fn from_sfx_slot(slot_bytes: &[u8], version: AkaoVersion) -> Result<Self> {
+        if slot_bytes.is_empty() {
+            return Err(Error::UnexpectedEof("AKAO SFX slot bytecode"));
+        }
+        let mut channel_starts = vec![None; version.max_channels()];
+        channel_starts[0] = Some(0);
+        Ok(Self {
+            version,
+            song_id: 0,
+            declared_length: 0,
+            reverb_type: 0,
+            initial_volume: 0,
+            header_param: 0,
+            channel_mask: 1,
+            rhythm_mask: 0,
+            secondary_mask: 0,
+            channel_starts,
+            drum_table: Vec::new(),
+            keysplit_table: Vec::new(),
+            data: slot_bytes.to_vec(),
+        })
     }
 
     /// Returns the number of active channels in this sequence.

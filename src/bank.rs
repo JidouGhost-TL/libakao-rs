@@ -4,7 +4,7 @@
 //!
 //! [`AkaoWaveBankView`] provides zero-allocation borrowed parsing usable in pure
 //! `#![no_std]` environments without `alloc`. With the `alloc` feature enabled,
-//! [`AkaoWaveBank`] provides an owned representation with relocation and upload.
+//! `AkaoWaveBank` provides an owned representation with relocation and upload.
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -90,8 +90,8 @@ pub struct AkaoWaveBankView<'a> {
 impl<'a> AkaoWaveBankView<'a> {
     /// Returns `true` if `bytes` has a structurally valid 64-byte unified `"AKAO"` wave bank
     /// header (`declared_length == 0`, zero reserved block `+0x20..+0x40`, 16-byte-aligned
-    /// `spu_base_addr` and non-zero `adpcm_len` within PS1 SPU RAM, and 16-byte-aligned
-    /// articulation table region).
+    /// `spu_base_addr` and non-zero `adpcm_len` within PS1 SPU RAM, valid articulation bounds,
+    /// and sufficient payload bytes — permitting trailing sector padding).
     #[must_use]
     pub fn is_unified_header(bytes: &[u8]) -> bool {
         if bytes.len() < WAVE_BANK_HEADER_SIZE + 0x20 {
@@ -109,19 +109,44 @@ impl<'a> AkaoWaveBankView<'a> {
         }
         let spu_base_addr = read_u32_le(bytes, 0x10);
         let adpcm_len = read_u32_le(bytes, 0x14) as usize;
+        let start_index = read_u32_le(bytes, 0x18) as usize;
+        let field_1c = read_u32_le(bytes, 0x1C) as usize;
         if (spu_base_addr & 0xF) != 0 || spu_base_addr as usize >= libspu2::PS1_RAM_SIZE {
             return false;
         }
         if adpcm_len == 0 || (adpcm_len & 0xF) != 0 || adpcm_len >= bytes.len() {
             return false;
         }
-        let Some(table_end) = bytes.len().checked_sub(adpcm_len) else {
-            return false;
-        };
-        if table_end <= WAVE_BANK_HEADER_SIZE || (table_end & 0xF) != 0 {
+        if validate_spu_range(spu_base_addr, adpcm_len).is_err() {
             return false;
         }
-        validate_spu_range(spu_base_addr, adpcm_len).is_ok()
+        let max_v3 = AkaoVersion::V3.max_wave_entries();
+        if start_index > max_v3 || field_1c > max_v3 {
+            return false;
+        }
+
+        // Verify that at least one unified generation layout (V1/V2a, V2b, or V3) fits within
+        // `bytes.len()`, matching `parse_unified_bank_view` (including sector-padded banks).
+        let fits = |count: usize, stride: usize| -> bool {
+            count > 0
+                && count
+                    .checked_mul(stride)
+                    .and_then(|art_len| WAVE_BANK_HEADER_SIZE.checked_add(art_len))
+                    .and_then(|off| off.checked_add(adpcm_len))
+                    .is_some_and(|total| total <= bytes.len())
+        };
+
+        let v3_fits = field_1c > 0 && fits(field_1c, 16);
+        let v1_v2a_fits = start_index <= 128
+            && if field_1c != 0 {
+                field_1c <= 128 - start_index && fits(field_1c, 64)
+            } else {
+                fits(1, 64)
+            };
+        let v2b_end = if field_1c == 0 { max_v3 } else { field_1c };
+        let v2b_fits = v2b_end > start_index && fits(v2b_end - start_index, 64);
+
+        v3_fits || v1_v2a_fits || v2b_fits
     }
 
     /// Parses a borrowed AKAO wave bank view for `version` without allocating.
@@ -148,7 +173,10 @@ impl<'a> AkaoWaveBankView<'a> {
         }
         let spu_base_addr = read_u32_le(all_bytes, 0x00);
         let adpcm_len = read_u32_le(all_bytes, 0x04) as usize;
-        if 0x10 + adpcm_len > all_bytes.len() {
+        let adpcm_end = 0x10usize
+            .checked_add(adpcm_len)
+            .ok_or(Error::OutOfRange("V1 .ALL ADPCM size overflow"))?;
+        if adpcm_end > all_bytes.len() {
             return Err(Error::UnexpectedEof("V1 .ALL ADPCM payload"));
         }
         if art_bytes.len() % 64 != 0 {
@@ -168,7 +196,7 @@ impl<'a> AkaoWaveBankView<'a> {
             start_index: 0,
             art_slice: art_bytes,
             art_count: count,
-            adpcm_data: &all_bytes[0x10..0x10 + adpcm_len],
+            adpcm_data: &all_bytes[0x10..adpcm_end],
         })
     }
 
@@ -309,20 +337,29 @@ impl AkaoWaveBank {
         let old_base = i64::from(self.spu_base_addr);
         let delta = i64::from(new_spu_base) - old_base;
 
-        for art in &mut self.articulations {
+        // First pass: validate all shifted addresses so errors never leave partial mutations.
+        for art in &self.articulations {
             if art.start_addr != 0 {
                 let shifted = i64::from(art.start_addr) + delta;
                 if shifted < 0 || shifted as usize >= libspu2::PS1_RAM_SIZE {
                     return Err(Error::OutOfRange("relocated start_addr out of SPU RAM"));
                 }
-                art.start_addr = shifted as u32;
             }
             if art.loop_addr != 0 {
                 let shifted = i64::from(art.loop_addr) + delta;
                 if shifted < 0 || shifted as usize >= libspu2::PS1_RAM_SIZE {
                     return Err(Error::OutOfRange("relocated loop_addr out of SPU RAM"));
                 }
-                art.loop_addr = shifted as u32;
+            }
+        }
+
+        // Second pass: apply validated shifts atomically.
+        for art in &mut self.articulations {
+            if art.start_addr != 0 {
+                art.start_addr = (i64::from(art.start_addr) + delta) as u32;
+            }
+            if art.loop_addr != 0 {
+                art.loop_addr = (i64::from(art.loop_addr) + delta) as u32;
             }
         }
 

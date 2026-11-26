@@ -6,6 +6,7 @@ rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/JidouGhost-TL/libakao-rs"
+documentation = "https://docs.rs/libakao"
 description = "Standalone pure-Rust PlayStation AKAO music sequencer built on libspu2"
 keywords = ["ps1", "akao", "sequencer", "spu", "audio"]
 categories = ["multimedia::audio", "emulators", "no-std"]
@@ -18,6 +19,11 @@ alloc = []
 [dependencies]
 libspu2 = { version = "0.2", path = "../libspu2-rs", default-features = false }
 
+[[test]]
+name = "akao_suite"
+required-features = ["alloc"]
+
 [[bench]]
 name = "bench_audio"
 harness = false
+required-features = ["std"]

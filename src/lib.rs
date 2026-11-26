@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![doc = include_str!("../README.md")]
+#![cfg_attr(feature = "alloc", doc = include_str!("../README.md"))]
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "Standalone pure-Rust PlayStation 1 **AKAO** music sequencer and hardware SPU synthesizer.\n\n\
+           Built without the `alloc` feature: exposes zero-copy borrowed parsers (`AkaoSequenceView`, \
+           `AkaoWaveBankView`, `AkaoSfxBankView`), opcode decoders (`decode_opcode`, `Opcode`, \
+           `ExtendedOpcode`), version detection (`AkaoVersion`, `detect_version`), and PS1 SPU reverb \
+           presets (`ReverbPreset`, `ReverbParams`). Enable the `alloc` or `std` feature for owned \
+           containers (`AkaoSequence`, `AkaoWaveBank`, `AkaoSfxBank`) and `AkaoPlayer`."
+)]
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

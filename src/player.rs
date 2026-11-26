@@ -6,12 +6,14 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use libspu2::registers::{ps1, CONTROL_ENABLE, CONTROL_REVERB, CONTROL_UNMUTE};
-use libspu2::{Device, StereoI16, VoiceState, PS1_RAM_SIZE, PS1_SAMPLE_RATE, VOICES_PER_CORE};
+use libspu2::{Device, StereoI16, VoiceState, PS1_SAMPLE_RATE, VOICES_PER_CORE};
 
 use crate::bank::AkaoWaveBank;
 use crate::opcodes::{decode_opcode, ExtendedOpcode, Opcode};
-use crate::reverb::{ReverbParams, ReverbPreset};
+use crate::reverb::ReverbPreset;
 use crate::sequence::AkaoSequence;
+use crate::sfx::AkaoSfxBank;
+use crate::version::AkaoVersion;
 use crate::{Error, Result};
 
 /// Maximum logical sequencer channels supported (`V3` = 32, `V1`/`V2` = 24).
@@ -678,26 +680,31 @@ impl AkaoPlayer {
         Ok(player)
     }
 
-    /// Resets playback state, channels, voice allocations, and SPU registers back to
-    /// the start of the sequence **without** re-uploading ADPCM wave-bank RAM.
+    /// Creates a new [`AkaoPlayer`] configured to play a single active slot from an [`AkaoSfxBank`].
+    ///
+    /// Wraps the slot's bytecode in a 1-channel [`AkaoSequence`] for `version` and uploads
+    /// `wave_bank` to a fresh PS1 SPU device.
+    pub fn from_sfx_slot(
+        sfx_bank: &AkaoSfxBank,
+        slot: usize,
+        wave_bank: AkaoWaveBank,
+        version: AkaoVersion,
+        config: RenderConfig,
+    ) -> Result<Self> {
+        let sequence = sfx_bank.to_sequence(slot, version)?;
+        Self::new(sequence, wave_bank, config)
+    }
+
+    /// Resets playback state, channels, voice allocations, and the underlying SPU device
+    /// (including reverb work-area RAM and FIR history) back to the start of the sequence
+    /// for bit-exact replay.
     pub fn reset(&mut self) -> Result<()> {
-        // Silence and reset all 24 hardware voices without wiping SPU RAM.
-        self.device.write_ps1_register(ps1::KOFF_LO, 0xFFFF)?;
-        self.device.write_ps1_register(ps1::KOFF_HI, 0x00FF)?;
-        for v in 0..VOICES_PER_CORE {
-            let vbase = (v as u32) * ps1::VOICE_STRIDE;
-            self.device.write_ps1_register(vbase + ps1::V_VOLL, 0)?;
-            self.device.write_ps1_register(vbase + ps1::V_VOLR, 0)?;
-            self.device.write_ps1_register(vbase + ps1::V_PITCH, 0)?;
-            self.device.write_ps1_register(vbase + ps1::V_ADSR1, 0)?;
-            self.device.write_ps1_register(vbase + ps1::V_ADSR2, 0)?;
+        self.device.reset();
+        if self.config.sample_rate != PS1_SAMPLE_RATE {
+            self.device
+                .set_output_sample_rate(self.config.sample_rate)?;
         }
-        self.device.write_ps1_register(ps1::PMON_LO, 0)?;
-        self.device.write_ps1_register(ps1::PMON_HI, 0)?;
-        self.device.write_ps1_register(ps1::NON_LO, 0)?;
-        self.device.write_ps1_register(ps1::NON_HI, 0)?;
-        self.device.write_ps1_register(ps1::EON_LO, 0)?;
-        self.device.write_ps1_register(ps1::EON_HI, 0)?;
+        self.bank.upload_to_spu(&mut self.device)?;
 
         self.tempo_fp16 = DEFAULT_TEMPO_FP16;
         self.tempo_slide_step = 0;
@@ -726,39 +733,18 @@ impl AkaoPlayer {
     }
 
     fn init_spu_and_channels(&mut self) -> Result<()> {
-        // Program PS1 SPU reverb preset registers, guarding RVB_WORK_ADDR against ADPCM overlap.
-        let preset = ReverbPreset::from_index((self.sequence.reverb_type & 0xFF) as u8)
-            .unwrap_or(ReverbPreset::Off);
-        let work_size = preset.work_area_size() as usize;
+        // Program PS1 SPU reverb preset registers, zero the reverb work area RAM to prevent
+        // echo bleed across `reset()`, and guard RVB_WORK_ADDR against ADPCM overlap.
+        let preset = if self.config.reverb_enabled {
+            ReverbPreset::from_index((self.sequence.reverb_type & 0xFF) as u8)
+                .unwrap_or(ReverbPreset::Off)
+        } else {
+            ReverbPreset::Off
+        };
         let bank_end =
             (self.bank.spu_base_addr as usize).saturating_add(self.bank.adpcm_data.len());
-        let work_start = PS1_RAM_SIZE.saturating_sub(work_size) & !7;
-
-        self.reverb_active = self.config.reverb_enabled
-            && preset != ReverbPreset::Off
-            && work_size > 0
-            && work_start >= bank_end;
-
-        let params = if self.reverb_active {
-            preset.params()
-        } else {
-            ReverbParams::ZERO
-        };
-
-        let regs = params.to_ps1_registers();
-        for (idx, &word) in regs.iter().enumerate() {
-            self.device
-                .write_ps1_register(ps1::RVB_BASE + (idx as u32) * 2, word)?;
-        }
-
-        let work_addr_reg = if self.reverb_active {
-            (work_start >> 3) as u16
-        } else {
-            // Safe top-of-RAM default when reverb write is disabled.
-            ((PS1_RAM_SIZE - 8) >> 3) as u16
-        };
-        self.device
-            .write_ps1_register(ps1::RVB_WORK_ADDR, work_addr_reg)?;
+        let init_rvb = 0x2000i16;
+        self.reverb_active = preset.apply(&mut self.device, init_rvb, init_rvb, bank_end)?;
 
         self.update_spucnt()?;
         self.device
@@ -766,13 +752,9 @@ impl AkaoPlayer {
         self.device
             .write_ps1_register(ps1::MVOLR, self.config.master_volume & 0x7FFF)?;
 
-        let init_rvb = if self.reverb_active { 0x2000i16 } else { 0 };
-        self.reverb_depth_l_fp16 = i32::from(init_rvb) << 16;
-        self.reverb_depth_r_fp16 = i32::from(init_rvb) << 16;
-        self.device
-            .write_ps1_register(ps1::EVOLL, init_rvb as u16)?;
-        self.device
-            .write_ps1_register(ps1::EVOLR, init_rvb as u16)?;
+        let active_rvb = if self.reverb_active { init_rvb } else { 0 };
+        self.reverb_depth_l_fp16 = i32::from(active_rvb) << 16;
+        self.reverb_depth_r_fp16 = i32::from(active_rvb) << 16;
 
         // Initialize voice allocator and channel states.
         self.voice_owner = [None; VOICES_PER_CORE];
@@ -1110,7 +1092,11 @@ impl AkaoPlayer {
     /// Renders the entire sequence (respecting `target_loops`, `fade_seconds`,
     /// `tail_seconds`, and `max_seconds`) into a [`RenderResult`].
     pub fn render_all(&mut self) -> Result<RenderResult> {
-        let mut samples = Vec::new();
+        let est_frames = self
+            .max_frames
+            .min(u64::from(self.config.sample_rate).saturating_mul(60))
+            .min((usize::MAX / 2) as u64) as usize;
+        let mut samples = Vec::with_capacity(est_frames.saturating_mul(2));
         let mut buf = [0i16; 2048];
         while !self.is_finished() {
             let frames = self.render_samples(&mut buf)?;
@@ -1139,11 +1125,10 @@ impl AkaoPlayer {
                 return Ok(0);
             }
 
-            let remaining_cap = (self.max_frames - self.frames_rendered) as usize;
+            let remaining_cap = (self.max_frames - self.frames_rendered).min(usize::MAX as u64) as usize;
             if self.phase == PlayPhase::Tail {
-                let to_render = max_wanted
-                    .min(self.tail_frames_remaining as usize)
-                    .min(remaining_cap);
+                let tail_cap = self.tail_frames_remaining.min(usize::MAX as u64) as usize;
+                let to_render = max_wanted.min(tail_cap).min(remaining_cap);
                 if to_render == 0 {
                     self.phase = PlayPhase::Finished;
                 }
@@ -1230,7 +1215,7 @@ impl AkaoPlayer {
         let new_int = self.sequence_volume_fp16 >> 16;
         if new_int != old_int {
             for ch in &mut self.channels[..self.channel_count] {
-                if ch.active {
+                if ch.active || ch.voice.is_some() {
                     ch.dirty_volume = true;
                 }
             }
@@ -1260,44 +1245,58 @@ impl AkaoPlayer {
         }
     }
 
-    fn allocate_voice(&mut self, ch_idx: usize) -> usize {
+    fn allocate_voice(&mut self, ch_idx: usize, pending_kon: u32) -> Option<usize> {
         // 1. Reuse already-owned hardware voice.
         if let Some(v) = self.channels[ch_idx].voice {
             let vi = usize::from(v);
             self.voice_age[vi] = self.timer_ticks;
-            return vi;
+            return Some(vi);
         }
 
         // 2. Prefer 1:1 hardware voice for channels 0..24 if currently free (preserves PMON adjacency).
-        if ch_idx < VOICES_PER_CORE && self.voice_owner[ch_idx].is_none() {
-            return self.assign_voice(ch_idx, ch_idx);
+        if ch_idx < VOICES_PER_CORE
+            && self.voice_owner[ch_idx].is_none()
+            && (pending_kon & (1u32 << ch_idx)) == 0
+        {
+            return Some(self.assign_voice(ch_idx, ch_idx));
         }
 
-        // 3. Any completely free hardware voice.
-        if let Some(free_v) = self.voice_owner.iter().position(|o| o.is_none()) {
-            return self.assign_voice(ch_idx, free_v);
+        // 3. Any completely free hardware voice not already keyed on this tick.
+        if let Some(free_v) = self
+            .voice_owner
+            .iter()
+            .enumerate()
+            .position(|(v, o)| o.is_none() && (pending_kon & (1u32 << v)) == 0)
+        {
+            return Some(self.assign_voice(ch_idx, free_v));
         }
 
-        // 4. Steal a voice owned by an inactive or resting/keyed-off channel.
+        // 4. Steal a voice owned by an inactive or resting/keyed-off channel (skipping pending KON).
         for (v, owner_opt) in self.voice_owner.iter().enumerate() {
+            if (pending_kon & (1u32 << v)) != 0 {
+                continue;
+            }
             if let Some(owner) = *owner_opt {
                 let och = &self.channels[usize::from(owner)];
                 if !och.active || (och.gate_remaining == 0 && !och.slur && !och.legato) {
-                    return self.assign_voice(ch_idx, v);
+                    return Some(self.assign_voice(ch_idx, v));
                 }
             }
         }
 
-        // 5. Steal the oldest voice (LRU by timer_ticks).
-        let mut oldest_v = 0usize;
+        // 5. Steal the oldest voice (LRU by timer_ticks), excluding voices keyed on this tick.
+        let mut oldest_v: Option<usize> = None;
         let mut oldest_age = u64::MAX;
         for (v, &age) in self.voice_age.iter().enumerate() {
+            if (pending_kon & (1u32 << v)) != 0 {
+                continue;
+            }
             if age < oldest_age {
                 oldest_age = age;
-                oldest_v = v;
+                oldest_v = Some(v);
             }
         }
-        self.assign_voice(ch_idx, oldest_v)
+        oldest_v.map(|v| self.assign_voice(ch_idx, v))
     }
 
     fn assign_voice(&mut self, ch_idx: usize, voice: usize) -> usize {
@@ -1316,16 +1315,6 @@ impl AkaoPlayer {
         ch.dirty_volume = true;
         self.dirty_voice_modes = true;
         voice
-    }
-
-    fn release_voice(&mut self, ch_idx: usize) {
-        if let Some(v) = self.channels[ch_idx].voice.take() {
-            let vi = usize::from(v);
-            if self.voice_owner[vi] == Some(ch_idx as u8) {
-                self.voice_owner[vi] = None;
-                self.dirty_voice_modes = true;
-            }
-        }
     }
 
     fn step_musical_tick(&mut self) -> Result<()> {
@@ -1530,7 +1519,6 @@ impl AkaoPlayer {
                         *koff_mask |= 1u32 << v;
                     }
                     self.channels[ch_idx].active = false;
-                    self.release_voice(ch_idx);
                     break;
                 }
                 Opcode::SetInstrument(inst) => {
@@ -1548,12 +1536,7 @@ impl AkaoPlayer {
                         ch.dirty_pitch = true;
                     }
                 }
-                Opcode::SetInstrumentAlt(inst) => {
-                    let ch = &mut self.channels[ch_idx];
-                    ch.instrument = inst;
-                    ch.resolved_instrument = inst;
-                    ch.dirty_pitch = true;
-                }
+                Opcode::SetInstrumentAlt(inst) => self.set_instrument_alt(ch_idx, inst),
                 Opcode::OverrideDuration(dur) => {
                     self.channels[ch_idx].duration_override = dur;
                 }
@@ -1806,7 +1789,6 @@ impl AkaoPlayer {
                             *koff_mask |= 1u32 << v;
                         }
                         ch.active = false;
-                        self.release_voice(ch_idx);
                         break;
                     }
                 }
@@ -1855,37 +1837,12 @@ impl AkaoPlayer {
                 Opcode::FixNoteLength(delta) => {
                     self.channels[ch_idx].fix_note_length = delta;
                 }
-                Opcode::VolumeBalance(bal) => {
-                    let ch = &mut self.channels[ch_idx];
-                    ch.volume_balance = bal.min(127);
-                    ch.dirty_volume = true;
-                }
-                Opcode::SetTempo(tempo) => {
-                    self.tempo_fp16 = u32::from(tempo) << 16;
-                    self.tempo_slide_ticks = 0;
-                }
-                Opcode::TempoSlide { duration, target } => {
-                    let ticks = u16::from(duration).max(1);
-                    let target_fp16 = (u32::from(target) << 16) as i64;
-                    let cur_fp16 = i64::from(self.tempo_fp16);
-                    self.tempo_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
-                    self.tempo_slide_ticks = ticks;
-                }
-                Opcode::SetReverbDepth(depth) => {
-                    self.reverb_depth_l_fp16 = i32::from(depth) << 16;
-                    self.reverb_depth_r_fp16 = i32::from(depth) << 16;
-                    self.reverb_slide_ticks = 0;
-                    if self.reverb_active {
-                        self.device.write_ps1_register(ps1::EVOLL, depth as u16)?;
-                        self.device.write_ps1_register(ps1::EVOLR, depth as u16)?;
-                    }
-                }
+                Opcode::VolumeBalance(bal) => self.set_volume_balance(ch_idx, bal),
+                Opcode::SetTempo(tempo) => self.set_tempo(tempo),
+                Opcode::TempoSlide { duration, target } => self.start_tempo_slide(duration, target),
+                Opcode::SetReverbDepth(depth) => self.set_reverb_depth(depth)?,
                 Opcode::ReverbDepthSlide { duration, target } => {
-                    let ticks = u16::from(duration).max(1);
-                    let target_fp16 = i64::from(target) << 16;
-                    let cur_fp16 = i64::from(self.reverb_depth_l_fp16);
-                    self.reverb_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
-                    self.reverb_slide_ticks = ticks;
+                    self.start_reverb_depth_slide(duration, target);
                 }
                 Opcode::DrumModeOnOffset(_) => {
                     self.channels[ch_idx].drum_mode = true;
@@ -1893,32 +1850,13 @@ impl AkaoPlayer {
                 Opcode::DrumModeOff => {
                     self.channels[ch_idx].drum_mode = false;
                 }
-                Opcode::Jump(offset) => {
-                    let target = resolve_rel_jump(pc + 1, offset, self.sequence.data.len())?;
-                    let ch = &mut self.channels[ch_idx];
-                    if target <= pc {
-                        ch.infinite_loops += 1;
-                    }
-                    ch.pc = target;
-                }
+                Opcode::Jump(offset) => self.execute_jump(ch_idx, pc, pc + 1, offset)?,
                 Opcode::ConditionalJump { condition, offset } => {
-                    if self.condition >= condition {
-                        let target = resolve_rel_jump(pc + 2, offset, self.sequence.data.len())?;
-                        self.channels[ch_idx].pc = target;
-                    }
+                    self.execute_conditional_jump(ch_idx, pc + 2, condition, offset)?;
                 }
                 Opcode::LoopBreak { iteration, offset }
                 | Opcode::LoopBreakAlt { iteration, offset } => {
-                    let ch = &mut self.channels[ch_idx];
-                    if ch.loop_depth > 0 {
-                        let slot = ch.loop_depth - 1;
-                        if ch.loop_stack[slot].iterations + 1 == u16::from(iteration) {
-                            ch.loop_depth -= 1;
-                            let target =
-                                resolve_rel_jump(pc + 2, offset, self.sequence.data.len())?;
-                            ch.pc = target;
-                        }
-                    }
+                    self.execute_loop_break(ch_idx, pc + 2, iteration, offset)?;
                 }
                 Opcode::SetKeysplit(_) => {
                     self.channels[ch_idx].keysplit_active = true;
@@ -1943,32 +1881,13 @@ impl AkaoPlayer {
         ext: ExtendedOpcode,
     ) -> Result<()> {
         match ext {
-            ExtendedOpcode::SetTempo(tempo) => {
-                self.tempo_fp16 = u32::from(tempo) << 16;
-                self.tempo_slide_ticks = 0;
-            }
+            ExtendedOpcode::SetTempo(tempo) => self.set_tempo(tempo),
             ExtendedOpcode::TempoSlide { duration, target } => {
-                let ticks = u16::from(duration).max(1);
-                let target_fp16 = (u32::from(target) << 16) as i64;
-                let cur_fp16 = i64::from(self.tempo_fp16);
-                self.tempo_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
-                self.tempo_slide_ticks = ticks;
+                self.start_tempo_slide(duration, target);
             }
-            ExtendedOpcode::SetReverbDepth(depth) => {
-                self.reverb_depth_l_fp16 = i32::from(depth) << 16;
-                self.reverb_depth_r_fp16 = i32::from(depth) << 16;
-                self.reverb_slide_ticks = 0;
-                if self.reverb_active {
-                    self.device.write_ps1_register(ps1::EVOLL, depth as u16)?;
-                    self.device.write_ps1_register(ps1::EVOLR, depth as u16)?;
-                }
-            }
+            ExtendedOpcode::SetReverbDepth(depth) => self.set_reverb_depth(depth)?,
             ExtendedOpcode::ReverbDepthSlide { duration, target } => {
-                let ticks = u16::from(duration).max(1);
-                let target_fp16 = i64::from(target) << 16;
-                let cur_fp16 = i64::from(self.reverb_depth_l_fp16);
-                self.reverb_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
-                self.reverb_slide_ticks = ticks;
+                self.start_reverb_depth_slide(duration, target);
             }
             ExtendedOpcode::DrumModeOn | ExtendedOpcode::DrumModeOnOffset(_) => {
                 self.channels[ch_idx].drum_mode = true;
@@ -1976,43 +1895,16 @@ impl AkaoPlayer {
             ExtendedOpcode::DrumModeOff => {
                 self.channels[ch_idx].drum_mode = false;
             }
-            ExtendedOpcode::Jump(offset) => {
-                let target = resolve_rel_jump(op_pc + 2, offset, self.sequence.data.len())?;
-                let ch = &mut self.channels[ch_idx];
-                if target <= op_pc {
-                    ch.infinite_loops += 1;
-                }
-                ch.pc = target;
-            }
+            ExtendedOpcode::Jump(offset) => self.execute_jump(ch_idx, op_pc, op_pc + 2, offset)?,
             ExtendedOpcode::ConditionalJump { condition, offset } => {
-                if self.condition >= condition {
-                    let target = resolve_rel_jump(op_pc + 3, offset, self.sequence.data.len())?;
-                    self.channels[ch_idx].pc = target;
-                }
+                self.execute_conditional_jump(ch_idx, op_pc + 3, condition, offset)?;
             }
             ExtendedOpcode::LoopBreak { iteration, offset }
             | ExtendedOpcode::LoopBreakAlt { iteration, offset } => {
-                let ch = &mut self.channels[ch_idx];
-                if ch.loop_depth > 0 {
-                    let slot = ch.loop_depth - 1;
-                    if ch.loop_stack[slot].iterations + 1 == u16::from(iteration) {
-                        ch.loop_depth -= 1;
-                        let target = resolve_rel_jump(op_pc + 3, offset, self.sequence.data.len())?;
-                        ch.pc = target;
-                    }
-                }
+                self.execute_loop_break(ch_idx, op_pc + 3, iteration, offset)?;
             }
-            ExtendedOpcode::SetInstrumentAlt(inst) => {
-                let ch = &mut self.channels[ch_idx];
-                ch.instrument = inst;
-                ch.resolved_instrument = inst;
-                ch.dirty_pitch = true;
-            }
-            ExtendedOpcode::VolumeBalance(bal) => {
-                let ch = &mut self.channels[ch_idx];
-                ch.volume_balance = bal.min(127);
-                ch.dirty_volume = true;
-            }
+            ExtendedOpcode::SetInstrumentAlt(inst) => self.set_instrument_alt(ch_idx, inst),
+            ExtendedOpcode::VolumeBalance(bal) => self.set_volume_balance(ch_idx, bal),
             ExtendedOpcode::SubroutineCall(offset) => {
                 let target = resolve_rel_jump(op_pc + 2, offset, self.sequence.data.len())?;
                 let ch = &mut self.channels[ch_idx];
@@ -2049,6 +1941,100 @@ impl AkaoPlayer {
         Ok(())
     }
 
+    fn set_tempo(&mut self, tempo: u16) {
+        self.tempo_fp16 = u32::from(tempo) << 16;
+        self.tempo_slide_ticks = 0;
+    }
+
+    fn start_tempo_slide(&mut self, duration: u8, target: u16) {
+        let ticks = u16::from(duration).max(1);
+        let target_fp16 = (u32::from(target) << 16) as i64;
+        let cur_fp16 = i64::from(self.tempo_fp16);
+        self.tempo_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
+        self.tempo_slide_ticks = ticks;
+    }
+
+    fn set_reverb_depth(&mut self, depth: i16) -> Result<()> {
+        self.reverb_depth_l_fp16 = i32::from(depth) << 16;
+        self.reverb_depth_r_fp16 = i32::from(depth) << 16;
+        self.reverb_slide_ticks = 0;
+        if self.reverb_active {
+            self.device.write_ps1_register(ps1::EVOLL, depth as u16)?;
+            self.device.write_ps1_register(ps1::EVOLR, depth as u16)?;
+        }
+        Ok(())
+    }
+
+    fn start_reverb_depth_slide(&mut self, duration: u8, target: i16) {
+        let ticks = u16::from(duration).max(1);
+        let target_fp16 = i64::from(target) << 16;
+        let cur_fp16 = i64::from(self.reverb_depth_l_fp16);
+        self.reverb_slide_step = ((target_fp16 - cur_fp16) / i64::from(ticks)) as i32;
+        self.reverb_slide_ticks = ticks;
+    }
+
+    fn set_instrument_alt(&mut self, ch_idx: usize, inst: u8) {
+        let ch = &mut self.channels[ch_idx];
+        ch.instrument = inst;
+        ch.resolved_instrument = inst;
+        ch.dirty_pitch = true;
+    }
+
+    fn set_volume_balance(&mut self, ch_idx: usize, bal: u8) {
+        let ch = &mut self.channels[ch_idx];
+        ch.volume_balance = bal.min(127);
+        ch.dirty_volume = true;
+    }
+
+    fn execute_jump(
+        &mut self,
+        ch_idx: usize,
+        op_pc: usize,
+        operand_addr: usize,
+        offset: i16,
+    ) -> Result<()> {
+        let target = resolve_rel_jump(operand_addr, offset, self.sequence.data.len())?;
+        let ch = &mut self.channels[ch_idx];
+        if target <= op_pc {
+            ch.infinite_loops += 1;
+        }
+        ch.pc = target;
+        Ok(())
+    }
+
+    fn execute_conditional_jump(
+        &mut self,
+        ch_idx: usize,
+        operand_addr: usize,
+        condition: u8,
+        offset: i16,
+    ) -> Result<()> {
+        if self.condition >= condition {
+            let target = resolve_rel_jump(operand_addr, offset, self.sequence.data.len())?;
+            self.channels[ch_idx].pc = target;
+        }
+        Ok(())
+    }
+
+    fn execute_loop_break(
+        &mut self,
+        ch_idx: usize,
+        operand_addr: usize,
+        iteration: u8,
+        offset: i16,
+    ) -> Result<()> {
+        let ch = &mut self.channels[ch_idx];
+        if ch.loop_depth > 0 {
+            let slot = ch.loop_depth - 1;
+            if ch.loop_stack[slot].iterations + 1 == u16::from(iteration) {
+                ch.loop_depth -= 1;
+                let target = resolve_rel_jump(operand_addr, offset, self.sequence.data.len())?;
+                ch.pc = target;
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_duration(&mut self, ch_idx: usize, default_dur: u8) -> u8 {
         let ch = &mut self.channels[ch_idx];
         if ch.duration_override != 0 {
@@ -2066,7 +2052,7 @@ impl AkaoPlayer {
         semitone: u8,
         duration: u8,
         kon_mask: &mut u32,
-        _koff_mask: &mut u32,
+        koff_mask: &mut u32,
     ) -> Result<()> {
         let dur_u16 = u16::from(duration).max(1);
         let prev_note = self.channels[ch_idx].current_note;
@@ -2113,8 +2099,9 @@ impl AkaoPlayer {
             }
         }
 
-        // Allocate or reuse a hardware SPU voice (0..24) cleanly without `ch % 24` aliasing.
-        let voice = self.allocate_voice(ch_idx);
+        // Allocate or reuse a hardware SPU voice (0..24) cleanly without `ch % 24` aliasing
+        // or same-tick cannibalization of voices already keyed on during this tick.
+        let voice_opt = self.allocate_voice(ch_idx, *kon_mask);
 
         let art_opt = self.bank.articulation(inst_idx).copied();
 
@@ -2167,17 +2154,21 @@ impl AkaoPlayer {
         ch.dirty_pitch = true;
         ch.dirty_volume = true;
 
-        // Program SPU start/loop addresses from resolved articulation.
-        if let Some(art) = art_opt {
-            let vbase = (voice as u32) * ps1::VOICE_STRIDE;
-            self.device
-                .write_ps1_register(vbase + ps1::V_START_ADDR, (art.start_addr >> 3) as u16)?;
-            self.device
-                .write_ps1_register(vbase + ps1::V_REPEAT_ADDR, (art.loop_addr >> 3) as u16)?;
-        }
+        // Program SPU start/loop addresses and key-on if a hardware voice was acquired.
+        if let Some(voice) = voice_opt {
+            if let Some(art) = art_opt {
+                let vbase = (voice as u32) * ps1::VOICE_STRIDE;
+                self.device
+                    .write_ps1_register(vbase + ps1::V_START_ADDR, (art.start_addr >> 3) as u16)?;
+                self.device
+                    .write_ps1_register(vbase + ps1::V_REPEAT_ADDR, (art.loop_addr >> 3) as u16)?;
+            }
 
-        if !self.channels[ch_idx].legato {
-            *kon_mask |= 1u32 << voice;
+            if !self.channels[ch_idx].legato {
+                let bit = 1u32 << voice;
+                *koff_mask &= !bit;
+                *kon_mask |= bit;
+            }
         }
         Ok(())
     }
@@ -2189,9 +2180,6 @@ impl AkaoPlayer {
 
         for ch_idx in 0..self.channel_count {
             let ch = &mut self.channels[ch_idx];
-            if !ch.active {
-                continue;
-            }
             let Some(voice) = ch.voice else {
                 continue;
             };
@@ -2275,9 +2263,6 @@ impl AkaoPlayer {
         let mut noise = 0u32;
         let mut reverb = 0u32;
         for ch in &self.channels[..self.channel_count] {
-            if !ch.active {
-                continue;
-            }
             let Some(v) = ch.voice else {
                 continue;
             };

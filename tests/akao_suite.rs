@@ -1223,3 +1223,267 @@ fn sfx_offset_table_bank_with_and_without_attributes() {
     assert!(AkaoSfxBankView::parse(&bad).is_err());
     assert!(AkaoSfxBankView::parse(b"NOPE00000000000000000000").is_err());
 }
+
+#[test]
+fn sfx_bank_regression_overscan_and_note_opcode_classification() {
+    use libakao::{AkaoSfxBank, AkaoSfxBankView, SFX_UNUSED_SLOT};
+
+    // Regression 1 (P0): 4-slot bank with non-zero attrs `[1, 1, 1, 1]` and payload > 259 B.
+    // `u16::from_le_bytes([1, 1]) == 257 < payload.len()` must NOT be over-scanned as slot 4.
+    let mut big = vec![0u8; 0x10];
+    big[0..4].copy_from_slice(b"AKAO");
+    for off in [0u16, 4, 8, 12] {
+        big.extend_from_slice(&off.to_le_bytes());
+    }
+    big.extend_from_slice(&[1, 1, 1, 1]);
+    let sfx0 = [0xA1, 0x00, 0x02, 0xA0];
+    let sfx1 = [0xA1, 0x01, 0x04, 0xA0];
+    let sfx2 = [0xA1, 0x02, 0x07, 0xA0];
+    let mut sfx3 = vec![0x02u8; 300];
+    *sfx3.last_mut().unwrap() = 0xA0;
+    big.extend_from_slice(&sfx0);
+    big.extend_from_slice(&sfx1);
+    big.extend_from_slice(&sfx2);
+    big.extend_from_slice(&sfx3);
+
+    let view = AkaoSfxBankView::parse(&big).unwrap();
+    assert_eq!(view.slot_count(), 4);
+    assert_eq!(view.active_count(), 4);
+    assert_eq!(view.slot_attribute(0), Some(1));
+    assert_eq!(view.slot_attribute(3), Some(1));
+    assert_eq!(view.slot_bytes(0), Some(sfx0.as_slice()));
+    assert_eq!(view.slot_bytes(1), Some(sfx1.as_slice()));
+    assert_eq!(view.slot_bytes(2), Some(sfx2.as_slice()));
+    assert_eq!(view.slot_bytes(3), Some(sfx3.as_slice()));
+
+    // Regression 2 (P0): Plain (no-attribute) SFX bank whose first slot begins with note opcodes
+    // (`0x00..=0x1F`) must NOT be misclassified as having an attribute table.
+    let mut note_plain = vec![0u8; 0x10];
+    note_plain[0..4].copy_from_slice(b"AKAO");
+    for off in [0u16, 3] {
+        note_plain.extend_from_slice(&off.to_le_bytes());
+    }
+    note_plain.extend_from_slice(&[0x02, 0x05, 0xA0, 0x04, 0x07, 0xA0]);
+    let view_plain = AkaoSfxBankView::parse(&note_plain).unwrap();
+    assert_eq!(view_plain.slot_count(), 2);
+    assert_eq!(view_plain.slot_attribute(0), None);
+    assert_eq!(view_plain.slot_bytes(0), Some(&[0x02, 0x05, 0xA0][..]));
+    assert_eq!(view_plain.slot_bytes(1), Some(&[0x04, 0x07, 0xA0][..]));
+
+    // Regression 3: Plain bank with >259 B payload starting with `[0xA1, 0x00]` (= 161) must not
+    // over-scan `[0xA1, 0x00]` as an offset entry.
+    let mut big_plain = vec![0u8; 0x10];
+    big_plain[0..4].copy_from_slice(b"AKAO");
+    for off in [0u16, 3] {
+        big_plain.extend_from_slice(&off.to_le_bytes());
+    }
+    big_plain.extend_from_slice(&[0xA1, 0x00, 0xA0]);
+    let mut tail = vec![0x02u8; 300];
+    *tail.last_mut().unwrap() = 0xA0;
+    big_plain.extend_from_slice(&tail);
+    let view_bp = AkaoSfxBankView::parse(&big_plain).unwrap();
+    assert_eq!(view_bp.slot_count(), 2);
+    assert_eq!(view_bp.slot_attribute(0), None);
+    assert_eq!(view_bp.slot_bytes(0), Some(&[0xA1, 0x00, 0xA0][..]));
+
+    // Regression 4: Unused slot (0xFFFF) with non-zero byte in candidate attr position cannot be
+    // treated as an attribute table.
+    let mut unused_non_zero = vec![0u8; 0x10];
+    unused_non_zero[0..4].copy_from_slice(b"AKAO");
+    for off in [SFX_UNUSED_SLOT, 0u16, 3u16] {
+        unused_non_zero.extend_from_slice(&off.to_le_bytes());
+    }
+    unused_non_zero.extend_from_slice(&[0x02, 0x05, 0xA0, 0x04, 0x07, 0xA0]);
+    let view_u = AkaoSfxBankView::parse(&unused_non_zero).unwrap();
+    assert_eq!(view_u.slot_attribute(0), None);
+    assert_eq!(view_u.slot_bytes(1), Some(&[0x02, 0x05, 0xA0][..]));
+
+    // Owned helper parity.
+    let owned = AkaoSfxBank::parse(&big).unwrap();
+    assert_eq!(owned.slot_count(), 4);
+    assert_eq!(owned.slot_offset(2), Some(8));
+    assert_eq!(owned.slot_attribute(2), Some(1));
+}
+
+#[test]
+fn unified_wave_bank_probe_accepts_sector_padding_and_relocate_is_atomic() {
+    let mut bank = vec![0u8; libakao::WAVE_BANK_HEADER_SIZE];
+    bank[0..4].copy_from_slice(b"AKAO");
+    bank[0x10..0x14].copy_from_slice(&0x1010u32.to_le_bytes());
+    bank[0x14..0x18].copy_from_slice(&0x20u32.to_le_bytes());
+    bank[0x18..0x1C].copy_from_slice(&0u32.to_le_bytes());
+    bank[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+    bank.extend_from_slice(&[0u8; 64]); // 1 x 64B articulation
+    bank.extend_from_slice(&[0u8; 32]); // 32B ADPCM
+
+    // Sector-padded to 2048 bytes and odd trailing padding (e.g. +7 bytes).
+    let mut sector_padded = bank.clone();
+    sector_padded.resize(2048, 0);
+    assert!(AkaoWaveBankView::is_unified_header(&sector_padded));
+    assert!(AkaoWaveBankView::parse(&sector_padded, AkaoVersion::V2a).is_ok());
+
+    let mut odd_padded = bank.clone();
+    odd_padded.extend_from_slice(&[0u8; 7]);
+    assert!(AkaoWaveBankView::is_unified_header(&odd_padded));
+    assert!(AkaoWaveBankView::parse(&odd_padded, AkaoVersion::V2a).is_ok());
+
+    // Atomic relocate(): error on second entry must not mutate first entry or spu_base_addr.
+    let art0 = Articulation {
+        start_addr: 0x2000,
+        loop_addr: 0x2010,
+        fine_tune: 0x1000,
+        adsr1: 0x00FF,
+        adsr2: 0x0000,
+    };
+    let art1 = Articulation {
+        start_addr: 0x1000,
+        loop_addr: 0x1010,
+        fine_tune: 0x1000,
+        adsr1: 0x00FF,
+        adsr2: 0x0000,
+    };
+    let mut owned =
+        AkaoWaveBank::from_parts(AkaoVersion::V2b, 0x2000, 0, vec![art0, art1], vec![0u8; 32])
+            .unwrap();
+    // Moving base from 0x2000 -> 0x0800 shifts delta = -0x1800, making art1.start_addr negative.
+    assert!(owned.relocate(0x0800).is_err());
+    assert_eq!(owned.spu_base_addr, 0x2000);
+    assert_eq!(owned.articulations[0].start_addr, 0x2000);
+    assert_eq!(owned.articulations[1].start_addr, 0x1000);
+}
+
+#[test]
+fn player_reset_clears_reverb_work_area_for_bit_exact_replay() {
+    let bank = synthetic_bank(AkaoVersion::V3, 0x1000);
+    let track: &[u8] = &[
+        0xFE, 0x00, 0x00, 0x6A, // SetTempo
+        0xA1, 0x00, // inst 0
+        0xA5, 0x04, // octave 4
+        0xA8, 0x7F, // vol 127
+        0xC2, // reverb ON
+        0xF0, 16, // note C, 16 ticks
+        0xA0, // halt
+    ];
+    let raw = build_sequence_with_reverb(AkaoVersion::V3, 1, &[track], 0, 0, 5 /* Hall */);
+    let seq = AkaoSequence::parse(&raw, Some(AkaoVersion::V3)).unwrap();
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.2,
+        max_seconds: 2.0,
+        reverb_enabled: true,
+        ..RenderConfig::bgm_default()
+    };
+    let mut player = AkaoPlayer::new(seq, bank, cfg).unwrap();
+    let run1 = player.render_all().unwrap();
+    assert!(run1.samples.iter().any(|&s| s != 0));
+
+    player.reset().unwrap();
+    let run2 = player.render_all().unwrap();
+    assert_eq!(
+        run1.samples, run2.samples,
+        "reverb work area leaked stale echoes across reset()"
+    );
+}
+
+#[test]
+fn v3_tick0_more_than_24_channels_preserves_voice_0() {
+    let bank = synthetic_bank(AkaoVersion::V3, 0x1000);
+    // 28 active V3 channels all triggering simultaneously on tick 0.
+    let track: &[u8] = &[
+        0xFE, 0x00, 0x00, 0x6A, // SetTempo
+        0xA1, 0x00, // inst 0
+        0xA5, 0x04, // octave 4
+        0xA8, 0x70, // vol
+        0xF0, 24, // note C, 24 ticks
+        0xA0,
+    ];
+    let tracks: Vec<&[u8]> = vec![track; 28];
+    let raw = build_sequence_with_reverb(AkaoVersion::V3, 0x0FFF_FFFF, &tracks, 0, 0, 0);
+    let seq = AkaoSequence::parse(&raw, Some(AkaoVersion::V3)).unwrap();
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.02,
+        max_seconds: 0.5,
+        ..RenderConfig::bgm_default()
+    };
+    let mut player = AkaoPlayer::new(seq, bank, cfg).unwrap();
+    let mut buf = [0i16; 512];
+    player.render_samples(&mut buf).unwrap();
+
+    // Channel 0 must still own hardware voice 0 (not stolen by channel 24..27 on tick 0).
+    let snap0 = player.channel_snapshot(0).unwrap();
+    assert_eq!(snap0.voice, 0);
+    // Channels 24..27 must NOT hold voice 0 on tick 0.
+    for ch in 24..28 {
+        assert_ne!(player.channel_snapshot(ch).unwrap().voice, 0);
+    }
+}
+
+#[test]
+fn sfx_bank_slot_playback_via_akao_player() {
+    use libakao::AkaoSfxBank;
+
+    let mut raw = vec![0u8; 0x10];
+    raw[0..4].copy_from_slice(b"AKAO");
+    for off in [libakao::SFX_UNUSED_SLOT, 0u16] {
+        raw.extend_from_slice(&off.to_le_bytes());
+    }
+    raw.extend_from_slice(&[0u8, 1u8]);
+    raw.extend_from_slice(&[0xA1, 0x00, 0xA5, 0x04, 0xA8, 0x7F, 0x02, 0xA0]);
+
+    let sfx_bank = AkaoSfxBank::parse(&raw).unwrap();
+    let wave_bank = synthetic_bank(AkaoVersion::V2a, 0x1000);
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.05,
+        max_seconds: 1.0,
+        ..RenderConfig::bgm_default()
+    };
+
+    // Unused slot errors cleanly.
+    assert!(
+        AkaoPlayer::from_sfx_slot(&sfx_bank, 0, wave_bank.clone(), AkaoVersion::V2a, cfg).is_err()
+    );
+
+    // Active slot renders audible PCM.
+    let mut player =
+        AkaoPlayer::from_sfx_slot(&sfx_bank, 1, wave_bank, AkaoVersion::V2a, cfg).unwrap();
+    let rendered = player.render_all().unwrap();
+    assert!(rendered.reached_end);
+    assert!(rendered.samples.iter().any(|&s| s != 0));
+}
+
+#[test]
+fn released_voice_is_attenuated_on_mute() {
+    // Channel 0 plays a short note with slow release then halts; channel 1 keeps playing.
+    let mut bank = synthetic_bank(AkaoVersion::V3, 0x1000);
+    bank.articulations[0].adsr2 = 0x0001; // very slow release
+    let ch0: &[u8] = &[
+        0xFE, 0x00, 0x00, 0x6A, 0xA1, 0x00, 0xA5, 0x04, 0xA8, 0x7F, 0xF0, 4, 0xA0,
+    ];
+    let ch1: &[u8] = &[0xA1, 0x00, 0xA5, 0x04, 0xA8, 0x01, 0xF0, 200, 0xA0];
+    let raw = build_sequence_with_reverb(AkaoVersion::V3, 0b11, &[ch0, ch1], 0, 0, 0);
+    let seq = AkaoSequence::parse(&raw, Some(AkaoVersion::V3)).unwrap();
+    let cfg = RenderConfig {
+        target_loops: 0,
+        tail_seconds: 0.05,
+        max_seconds: 2.0,
+        reverb_enabled: false,
+        ..RenderConfig::bgm_default()
+    };
+    let mut player = AkaoPlayer::new(seq, bank, cfg).unwrap();
+    let mut buf = [0i16; 2048];
+    // Render past ch0's 4-tick note so ch0 is inactive (!active) while voice 0 is still releasing.
+    for _ in 0..4 {
+        player.render_samples(&mut buf).unwrap();
+    }
+    let snap = player.channel_snapshot(0).unwrap();
+    assert!(!snap.active);
+    assert_eq!(snap.voice, 0);
+
+    // Muting channel 0 must zero voice 0's V_VOLL/V_VOLR even though ch0.active == false.
+    player.set_channel_muted(0, true);
+    let v0 = player.device().inspect_voice(0, 0).unwrap();
+    assert_eq!(v0.volume_left, 0);
+    assert_eq!(v0.volume_right, 0);
+}
